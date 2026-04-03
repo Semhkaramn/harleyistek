@@ -1,0 +1,59 @@
+{
+  "name": "Telegram Anti-Spam Bot",
+  "description": "Onaylı gruplarda spam join request'leri otomatik reddeder",
+  "repository": "https://github.com/your-repo/telegram-anti-spam-bot",
+  "keywords": ["telegram", "bot", "anti-spam", "telethon"],
+  "env": {
+    "API_ID": {
+      "description": "Telegram API ID (my.telegram.org'dan alın)",
+      "required": true
+    },
+    "API_HASH": {
+      "description": "Telegram API Hash (my.telegram.org'dan alın)",
+      "required": true
+    },
+    "SESSION_STRING": {
+      "description": "Telethon session string (generate_session.py ile oluşturun)",
+      "required": true
+    },
+    "PROTECTED_GROUPS": {
+      "description": "Korunacak grup ID'leri (virgülle ayırın)",
+      "required": true
+    },
+    "LOG_CHANNEL_ID": {
+      "description": "Log kanalı ID'si",
+      "required": true
+    },
+    "ADMIN_IDS": {
+      "description": "Admin kullanıcı ID'leri (virgülle ayırın)",
+      "required": false,
+      "value": ""
+    },
+    "FLOOD_WINDOW_SECONDS": {
+      "description": "Flood kontrol penceresi (saniye)",
+      "required": false,
+      "value": "3"
+    },
+    "FLOOD_THRESHOLD": {
+      "description": "Flood eşiği (istek sayısı)",
+      "required": false,
+      "value": "10"
+    },
+    "STATS_INTERVAL": {
+      "description": "İstatistik rapor aralığı (saniye)",
+      "required": false,
+      "value": "3600"
+    }
+  },
+  "formation": {
+    "worker": {
+      "quantity": 1,
+      "size": "eco"
+    }
+  },
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    }
+  ]
+}
