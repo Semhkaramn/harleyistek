@@ -327,9 +327,10 @@ class AntiSpamBot:
                 f"└ Flood Eşiği: {FLOOD_THRESHOLD} istek"
             )
 
-    async def clear_all_requests(self, chat_id: int) -> int:
-        """Bir gruptaki tüm bekleyen istekleri reddet"""
-        rejected_count = 0
+    async def clear_all_requests(self, chat_id: int, status_callback=None) -> int:
+        """Bir gruptaki tüm bekleyen istekleri reddet - HEPSİ BİTENE KADAR"""
+        total_rejected = 0
+        pass_count = 0
 
         try:
             # Grup entity'sini al
@@ -338,25 +339,32 @@ class AntiSpamBot:
 
             logger.info(f"🧹 {chat_title} temizleniyor...")
 
-            # Bekleyen istekleri al
-            offset_date = None
-            offset_user = None
-
+            # HEPSİ BİTENE KADAR DEVAM ET
             while True:
+                pass_count += 1
+                found_any = False
+
+                # Her seferinde baştan al (offset kullanma - yeni gelenler de olabilir)
                 try:
                     result = await self.client(GetChatInviteImportersRequest(
                         peer=chat_id,
                         requested=True,
                         limit=100,
-                        offset_date=offset_date,
-                        offset_user=offset_user or 0,
+                        offset_date=None,
+                        offset_user=0,
                         q=""
                     ))
 
                     if not result.importers:
+                        logger.info(f"✅ {chat_title} - Bekleyen istek kalmadı!")
                         break
 
-                    for importer in result.importers:
+                    found_any = True
+                    batch_count = len(result.importers)
+                    logger.info(f"📋 Pass {pass_count}: {batch_count} istek bulundu")
+
+                    # Tüm istekleri hızlıca reddet
+                    for i, importer in enumerate(result.importers):
                         try:
                             await self.client(HideChatJoinRequestRequest(
                                 peer=chat_id,
@@ -364,37 +372,54 @@ class AntiSpamBot:
                                 approved=False
                             ))
 
-                            rejected_count += 1
+                            total_rejected += 1
                             self.stats.total_rejected += 1
 
                             # Grup istatistiklerini güncelle
                             if chat_id in self.stats.groups:
                                 self.stats.groups[chat_id].rejected_requests += 1
 
-                            logger.info(f"🚫 Reddedildi: User {importer.user_id}")
+                            # Her 10 istekte bir log
+                            if total_rejected % 10 == 0:
+                                logger.info(f"🚫 {total_rejected} istek reddedildi...")
 
-                            # Rate limit koruması
-                            await asyncio.sleep(0.2)
+                            # Çok kısa bekleme (rate limit için minimal)
+                            await asyncio.sleep(0.03)
 
                         except Exception as e:
+                            if "HIDE_REQUESTER_MISSING" in str(e):
+                                # İstek zaten işlenmiş, devam et
+                                continue
                             logger.error(f"❌ Red hatası: {e}")
-
-                    # Sonraki sayfa için offset ayarla
-                    if len(result.importers) < 100:
-                        break
-
-                    last = result.importers[-1]
-                    offset_date = last.date
-                    offset_user = last.user_id
+                            await asyncio.sleep(0.1)
 
                 except Exception as e:
-                    logger.error(f"❌ İstek listesi alınamadı: {e}")
+                    error_str = str(e)
+                    if "FLOOD_WAIT" in error_str:
+                        # FloodWait hatası - bekle ve devam et
+                        import re
+                        wait_match = re.search(r'(\d+)', error_str)
+                        wait_time = int(wait_match.group(1)) if wait_match else 5
+                        logger.warning(f"⏳ FloodWait: {wait_time} saniye bekleniyor...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        logger.error(f"❌ İstek listesi hatası: {e}")
+                        await asyncio.sleep(1)
+                        continue
+
+                # Eğer hiç istek bulamadıysak çık
+                if not found_any:
                     break
+
+                # Kısa bir mola ver ve tekrar kontrol et
+                await asyncio.sleep(0.5)
 
         except Exception as e:
             logger.error(f"❌ Grup erişim hatası {chat_id}: {e}")
 
-        return rejected_count
+        logger.info(f"✅ {chat_title} temizlendi: {total_rejected} istek reddedildi")
+        return total_rejected
 
     async def on_raw_update(self, event):
         """Raw update handler - Join Request'leri yakalar"""
