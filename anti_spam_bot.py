@@ -1,20 +1,21 @@
 """
 Telegram Anti-Spam Bot
 =======================
-Onaylı gruplarda spam join request'leri yönetir.
+2 ayrı grup seti ve 2 ayrı log grubu ile çalışır.
+Her log grubu kendi grubunu kontrol eder.
 İstek sayısı 20'yi geçerse otomatik temizler.
 
-Komutlar (Log grubunda yazılır):
-  /ac       - Botu aktif et
-  /kapat    - Botu kapat
-  /temizle  - Tüm bekleyen istekleri reddet
+Komutlar (İlgili log grubunda yazılır):
+  /ac       - Botu aktif et (o grup için)
+  /kapat    - Botu kapat (o grup için)
+  /temizle  - Tüm bekleyen istekleri reddet (o grup için)
 """
 
 import asyncio
 import os
 from datetime import datetime
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import Dict, List
 from enum import Enum
 import logging
 
@@ -33,11 +34,13 @@ API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 SESSION_STRING = os.getenv("SESSION_STRING", "")
 
-# Korunan grup ID'leri (birden fazla grup ekleyebilirsiniz)
-PROTECTED_GROUPS = [int(x.strip()) for x in os.getenv("PROTECTED_GROUPS", "").split(",") if x.strip()]
+# Grup 1 ayarları
+PROTECTED_GROUPS_1 = [int(x.strip()) for x in os.getenv("PROTECTED_GROUPS_1", "").split(",") if x.strip()]
+LOG_CHANNEL_ID_1 = int(os.getenv("LOG_CHANNEL_ID_1", "0"))
 
-# Log grubu ID'si (komutlar buradan alınır, loglar buraya gönderilir)
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
+# Grup 2 ayarları
+PROTECTED_GROUPS_2 = [int(x.strip()) for x in os.getenv("PROTECTED_GROUPS_2", "").split(",") if x.strip()]
+LOG_CHANNEL_ID_2 = int(os.getenv("LOG_CHANNEL_ID_2", "0"))
 
 # Otomatik temizleme eşiği
 AUTO_CLEAN_THRESHOLD = 20
@@ -69,13 +72,14 @@ class GroupStats:
     pending_count: int = 0
 
 @dataclass
-class GlobalStats:
-    """Genel istatistikler"""
+class GroupSetStats:
+    """Bir grup seti için istatistikler"""
     total_rejected: int = 0
     groups: Dict[int, GroupStats] = field(default_factory=dict)
-
-# Global değişkenler
-stats = GlobalStats()
+    state: BotState = BotState.ACTIVE
+    clearing_in_progress: bool = False
+    accumulated_rejected: int = 0
+    last_cleanup_time: datetime = None
 
 # ═══════════════════════════════════════════════════════════════
 # BOT SINIFI
@@ -98,12 +102,31 @@ class AntiSpamBot:
                 API_HASH
             )
 
-        self.stats = stats
-        self.state = BotState.ACTIVE
-        self.clearing_in_progress = False
+        # Her grup seti için ayrı state
+        self.group_sets = {}
+
+        # Grup 1 için
+        if LOG_CHANNEL_ID_1 and PROTECTED_GROUPS_1:
+            self.group_sets[1] = {
+                'protected_groups': PROTECTED_GROUPS_1,
+                'log_channel': LOG_CHANNEL_ID_1,
+                'stats': GroupSetStats()
+            }
+
+        # Grup 2 için
+        if LOG_CHANNEL_ID_2 and PROTECTED_GROUPS_2:
+            self.group_sets[2] = {
+                'protected_groups': PROTECTED_GROUPS_2,
+                'log_channel': LOG_CHANNEL_ID_2,
+                'stats': GroupSetStats()
+            }
+
+        # Log channel -> group set mapping
+        self.log_to_set = {}
+        for set_id, data in self.group_sets.items():
+            self.log_to_set[data['log_channel']] = set_id
+
         self.me = None
-        self.accumulated_rejected = 0
-        self.last_cleanup_time = None
 
     async def start(self):
         """Botu başlat"""
@@ -114,21 +137,27 @@ class AntiSpamBot:
         self.me = await self.client.get_me()
         logger.info(f"Giriş yapıldı: @{self.me.username} ({self.me.first_name})")
 
-        # Komut handler - SADECE LOG GRUBUNDAN
-        self.client.add_event_handler(
-            self.on_command,
-            events.NewMessage(
-                chats=[LOG_CHANNEL_ID],
-                pattern=r'^/(ac|kapat|temizle)$'
-            )
-        )
+        # Tüm log kanallarından komut al
+        all_log_channels = [data['log_channel'] for data in self.group_sets.values()]
 
-        logger.info(f"Korunan grup: {len(PROTECTED_GROUPS)}")
-        logger.info(f"Log grubu: {LOG_CHANNEL_ID}")
+        if all_log_channels:
+            self.client.add_event_handler(
+                self.on_command,
+                events.NewMessage(
+                    chats=all_log_channels,
+                    pattern=r'^/(ac|kapat|temizle)$'
+                )
+            )
+
+        # Bilgilendirme logları
+        for set_id, data in self.group_sets.items():
+            logger.info(f"Grup Seti {set_id}: {len(data['protected_groups'])} grup, Log: {data['log_channel']}")
+
         logger.info("Bot AÇIK başladı.")
 
         # Başlangıçta hemen kontrol et
-        await self.check_and_auto_clean()
+        for set_id in self.group_sets:
+            await self.check_and_auto_clean(set_id)
 
         # Periyodik kontrol başlat
         asyncio.create_task(self.periodic_check())
@@ -140,98 +169,113 @@ class AntiSpamBot:
         while True:
             await asyncio.sleep(10)
 
-            if self.state != BotState.ACTIVE or self.clearing_in_progress:
-                continue
+            for set_id, data in self.group_sets.items():
+                stats = data['stats']
 
-            # 2 dakika silme olmadıysa ve birikmiş varsa log at
-            if self.last_cleanup_time and self.accumulated_rejected > 0:
-                elapsed = (datetime.now() - self.last_cleanup_time).total_seconds()
-                if elapsed >= 120:  # 2 dakika
-                    await self.send_log(f"✅ {self.accumulated_rejected} istek temizlendi")
-                    self.accumulated_rejected = 0
-                    self.last_cleanup_time = None
+                if stats.state != BotState.ACTIVE or stats.clearing_in_progress:
+                    continue
 
-            # Tüm gruplardaki toplam bekleyen istek sayısını al
-            total_pending = 0
-            for group_id in PROTECTED_GROUPS:
-                count = await self.get_pending_count(group_id)
-                total_pending += count
+                # 2 dakika silme olmadıysa ve birikmiş varsa log at
+                if stats.last_cleanup_time and stats.accumulated_rejected > 0:
+                    elapsed = (datetime.now() - stats.last_cleanup_time).total_seconds()
+                    if elapsed >= 120:  # 2 dakika
+                        await self.send_log(set_id, f"✅ {stats.accumulated_rejected} istek temizlendi")
+                        stats.accumulated_rejected = 0
+                        stats.last_cleanup_time = None
 
-            if total_pending > AUTO_CLEAN_THRESHOLD:
-                await self.do_cleanup(manual=False)
+                # Grup setindeki toplam bekleyen istek sayısını al
+                total_pending = 0
+                for group_id in data['protected_groups']:
+                    count = await self.get_pending_count(group_id)
+                    total_pending += count
+
+                if total_pending > AUTO_CLEAN_THRESHOLD:
+                    await self.do_cleanup(set_id, manual=False)
 
     async def on_command(self, event):
-        """Komut handler - Sadece log grubundan"""
+        """Komut handler - Log gruplarından"""
         command = event.text.lower().strip('/')
+        chat_id = event.chat_id
+
+        # Hangi grup setine ait olduğunu bul
+        set_id = self.log_to_set.get(chat_id)
+        if set_id is None:
+            return
+
+        data = self.group_sets[set_id]
+        stats = data['stats']
 
         # ═══════════════════════════════════════════════════════
-        # /ac - Botu aktif et
+        # /ac - Botu aktif et (o grup seti için)
         # ═══════════════════════════════════════════════════════
         if command == 'ac':
-            if self.state == BotState.ACTIVE:
-                await event.reply("Bot zaten aktif!")
+            if stats.state == BotState.ACTIVE:
+                await event.reply(f"Bot zaten aktif! (Grup Seti {set_id})")
                 return
 
-            if self.state == BotState.CLEARING:
+            if stats.state == BotState.CLEARING:
                 await event.reply("Temizleme devam ediyor, bekleyin...")
                 return
 
-            self.state = BotState.ACTIVE
-            logger.info("Bot AKTİF edildi")
-            await event.reply("🟢 Bot aktif!")
+            stats.state = BotState.ACTIVE
+            logger.info(f"Grup Seti {set_id} AKTİF edildi")
+            await event.reply(f"🟢 Bot aktif! (Grup Seti {set_id})")
 
             # Açılınca hemen 20+ kontrol et
-            await self.check_and_auto_clean()
+            await self.check_and_auto_clean(set_id)
 
         # ═══════════════════════════════════════════════════════
-        # /kapat - Botu kapat
+        # /kapat - Botu kapat (o grup seti için)
         # ═══════════════════════════════════════════════════════
         elif command == 'kapat':
-            if self.state == BotState.INACTIVE:
-                await event.reply("Bot zaten kapalı!")
+            if stats.state == BotState.INACTIVE:
+                await event.reply(f"Bot zaten kapalı! (Grup Seti {set_id})")
                 return
 
-            if self.state == BotState.CLEARING:
+            if stats.state == BotState.CLEARING:
                 await event.reply("Temizleme devam ediyor, bekleyin...")
                 return
 
-            self.state = BotState.INACTIVE
-            logger.info("Bot KAPATILDI")
-            await event.reply("🔴 Bot kapatıldı!")
+            stats.state = BotState.INACTIVE
+            logger.info(f"Grup Seti {set_id} KAPATILDI")
+            await event.reply(f"🔴 Bot kapatıldı! (Grup Seti {set_id})")
 
         # ═══════════════════════════════════════════════════════
-        # /temizle - Tüm istekleri reddet
+        # /temizle - Tüm istekleri reddet (o grup seti için)
         # ═══════════════════════════════════════════════════════
         elif command == 'temizle':
-            if self.clearing_in_progress:
+            if stats.clearing_in_progress:
                 await event.reply("Temizleme zaten devam ediyor...")
                 return
 
-            await self.do_cleanup(manual=True)
+            await self.do_cleanup(set_id, manual=True)
 
-    async def do_cleanup(self, manual=False):
-        """Tüm istekleri temizle"""
-        if self.clearing_in_progress:
+    async def do_cleanup(self, set_id: int, manual=False):
+        """Belirli grup setindeki tüm istekleri temizle"""
+        data = self.group_sets[set_id]
+        stats = data['stats']
+
+        if stats.clearing_in_progress:
             return
 
-        previous_state = self.state
-        self.state = BotState.CLEARING
-        self.clearing_in_progress = True
+        previous_state = stats.state
+        stats.state = BotState.CLEARING
+        stats.clearing_in_progress = True
 
-        # Tüm gruplardaki istekleri temizle
+        # Bu setteki tüm gruplardaki istekleri temizle
         total_rejected = 0
-        for group_id in PROTECTED_GROUPS:
+        for group_id in data['protected_groups']:
             rejected = await self.clear_all_requests(group_id)
             total_rejected += rejected
 
-        self.clearing_in_progress = False
-        self.state = previous_state if not manual else BotState.INACTIVE
+        stats.clearing_in_progress = False
+        stats.state = previous_state if not manual else BotState.INACTIVE
 
         # Biriktir
-        self.accumulated_rejected += total_rejected
-        self.last_cleanup_time = datetime.now()
+        stats.accumulated_rejected += total_rejected
+        stats.last_cleanup_time = datetime.now()
 
-        logger.info(f"Temizlendi: {total_rejected} (Toplam: {self.accumulated_rejected})")
+        logger.info(f"Grup Seti {set_id} - Temizlendi: {total_rejected} (Toplam: {stats.accumulated_rejected})")
 
     async def clear_all_requests(self, chat_id: int) -> int:
         """Bir gruptaki tüm bekleyen istekleri reddet"""
@@ -240,8 +284,6 @@ class AntiSpamBot:
         try:
             chat = await self.client.get_entity(chat_id)
             chat_title = chat.title if hasattr(chat, 'title') else f"Grup {chat_id}"
-
-
 
             while True:
                 try:
@@ -266,7 +308,6 @@ class AntiSpamBot:
                             ))
 
                             total_rejected += 1
-                            self.stats.total_rejected += 1
 
                             if total_rejected % 10 == 0:
                                 logger.info(f"{total_rejected} istek reddedildi...")
@@ -297,10 +338,6 @@ class AntiSpamBot:
         except Exception as e:
             logger.error(f"Grup erişim hatası {chat_id}: {e}")
 
-        # Grup pending count'u sıfırla
-        if chat_id in self.stats.groups:
-            self.stats.groups[chat_id].pending_count = 0
-
         return total_rejected
 
     async def get_pending_count(self, chat_id: int) -> int:
@@ -318,27 +355,35 @@ class AntiSpamBot:
         except:
             return 0
 
-    async def check_and_auto_clean(self):
-        """20'yi geçerse otomatik temizle - /ac komutu için"""
-        if self.clearing_in_progress:
+    async def check_and_auto_clean(self, set_id: int):
+        """20'yi geçerse otomatik temizle"""
+        data = self.group_sets[set_id]
+        stats = data['stats']
+
+        if stats.clearing_in_progress:
             return
 
         total_pending = 0
-        for group_id in PROTECTED_GROUPS:
+        for group_id in data['protected_groups']:
             count = await self.get_pending_count(group_id)
             total_pending += count
 
         if total_pending > AUTO_CLEAN_THRESHOLD:
-            logger.info(f"Otomatik temizleme: {total_pending} istek")
-            await self.do_cleanup(manual=False)
+            logger.info(f"Grup Seti {set_id} - Otomatik temizleme: {total_pending} istek")
+            await self.do_cleanup(set_id, manual=False)
 
-    async def send_log(self, message: str):
-        """Log grubuna mesaj gönder"""
-        if not LOG_CHANNEL_ID:
+    async def send_log(self, set_id: int, message: str):
+        """Belirli grup setinin log grubuna mesaj gönder"""
+        data = self.group_sets.get(set_id)
+        if not data:
+            return
+
+        log_channel = data['log_channel']
+        if not log_channel:
             return
 
         try:
-            await self.client.send_message(LOG_CHANNEL_ID, message)
+            await self.client.send_message(log_channel, f"[Grup Seti {set_id}] {message}")
         except Exception as e:
             logger.error(f"Log gönderme hatası: {e}")
 
@@ -352,12 +397,24 @@ async def main():
         logger.error("API_ID ve API_HASH ayarlanmamış!")
         return
 
-    if not LOG_CHANNEL_ID:
-        logger.error("LOG_CHANNEL_ID ayarlanmamış!")
-        return
+    # En az bir grup seti tanımlı olmalı
+    has_group_set = False
 
-    if not PROTECTED_GROUPS:
-        logger.warning("PROTECTED_GROUPS boş")
+    if LOG_CHANNEL_ID_1 and PROTECTED_GROUPS_1:
+        has_group_set = True
+        logger.info(f"Grup Seti 1 yapılandırıldı: {len(PROTECTED_GROUPS_1)} grup")
+    else:
+        logger.warning("Grup Seti 1 yapılandırılmamış (PROTECTED_GROUPS_1 veya LOG_CHANNEL_ID_1 eksik)")
+
+    if LOG_CHANNEL_ID_2 and PROTECTED_GROUPS_2:
+        has_group_set = True
+        logger.info(f"Grup Seti 2 yapılandırıldı: {len(PROTECTED_GROUPS_2)} grup")
+    else:
+        logger.warning("Grup Seti 2 yapılandırılmamış (PROTECTED_GROUPS_2 veya LOG_CHANNEL_ID_2 eksik)")
+
+    if not has_group_set:
+        logger.error("En az bir grup seti yapılandırılmalı!")
+        return
 
     bot = AntiSpamBot()
     await bot.start()
@@ -365,12 +422,15 @@ async def main():
 if __name__ == "__main__":
     print("""
     ╔═══════════════════════════════════════════════════════════╗
-    ║          TELEGRAM ANTI-SPAM BOT                           ║
+    ║          TELEGRAM ANTI-SPAM BOT (2 GRUP SETİ)             ║
     ╠═══════════════════════════════════════════════════════════╣
-    ║  Komutlar (Log grubunda yazılır):                         ║
-    ║    /ac      - Botu aktif et                               ║
-    ║    /kapat   - Botu kapat                                  ║
-    ║    /temizle - Tüm istekleri reddet                        ║
+    ║  Komutlar (İlgili log grubunda yazılır):                  ║
+    ║    /ac      - Botu aktif et (o grup seti için)            ║
+    ║    /kapat   - Botu kapat (o grup seti için)               ║
+    ║    /temizle - Tüm istekleri reddet (o grup seti için)     ║
+    ║                                                           ║
+    ║  Grup Seti 1: PROTECTED_GROUPS_1 + LOG_CHANNEL_ID_1       ║
+    ║  Grup Seti 2: PROTECTED_GROUPS_2 + LOG_CHANNEL_ID_2       ║
     ║                                                           ║
     ║  20+ istek = Otomatik temizleme                           ║
     ╚═══════════════════════════════════════════════════════════╝
