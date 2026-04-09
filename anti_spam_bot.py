@@ -121,17 +121,34 @@ class AntiSpamBot:
             )
         )
 
-        # Raw update handler for join requests
-        self.client.add_event_handler(
-            self.on_raw_update,
-            events.Raw()
-        )
+
 
         logger.info(f"Korunan grup: {len(PROTECTED_GROUPS)}")
         logger.info(f"Log grubu: {LOG_CHANNEL_ID}")
         logger.info("Bot KAPALI başladı. /ac komutu ile açın.")
 
+        # Periyodik kontrol başlat
+        asyncio.create_task(self.periodic_check())
+
         await self.client.run_until_disconnected()
+
+    async def periodic_check(self):
+        """Her 10 saniyede bir istek sayısını kontrol et"""
+        while True:
+            await asyncio.sleep(10)
+
+            if self.state != BotState.ACTIVE or self.clearing_in_progress:
+                continue
+
+            # Tüm gruplardaki toplam bekleyen istek sayısını al
+            total_pending = 0
+            for group_id in PROTECTED_GROUPS:
+                count = await self.get_pending_count(group_id)
+                total_pending += count
+
+            if total_pending > AUTO_CLEAN_THRESHOLD:
+                logger.info(f"Otomatik temizleme: {total_pending} istek (>{AUTO_CLEAN_THRESHOLD})")
+                await self.do_cleanup(manual=False)
 
     async def on_command(self, event):
         """Komut handler - Sadece log grubundan"""
@@ -296,8 +313,8 @@ class AntiSpamBot:
             return 0
 
     async def check_and_auto_clean(self):
-        """20'yi geçerse otomatik temizle"""
-        if self.state != BotState.ACTIVE or self.clearing_in_progress:
+        """20'yi geçerse otomatik temizle - /ac komutu için"""
+        if self.clearing_in_progress:
             return
 
         total_pending = 0
@@ -305,40 +322,9 @@ class AntiSpamBot:
             count = await self.get_pending_count(group_id)
             total_pending += count
 
-            if group_id not in self.stats.groups:
-                self.stats.groups[group_id] = GroupStats()
-            self.stats.groups[group_id].pending_count = count
-
         if total_pending > AUTO_CLEAN_THRESHOLD:
-            logger.info(f"Otomatik temizleme tetiklendi: {total_pending} istek")
+            logger.info(f"Otomatik temizleme: {total_pending} istek")
             await self.do_cleanup(manual=False)
-
-    async def on_raw_update(self, event):
-        """Raw update handler - Join Request'leri yakalar"""
-        from telethon.tl.types import UpdateBotChatInviteRequester
-
-        if self.state != BotState.ACTIVE:
-            return
-
-        if not isinstance(event, UpdateBotChatInviteRequester):
-            return
-
-        chat_id = event.peer.channel_id if hasattr(event.peer, 'channel_id') else event.peer.chat_id
-
-        # Korunan gruplardan biri mi kontrol et
-        if PROTECTED_GROUPS and chat_id not in PROTECTED_GROUPS and -100*chat_id not in PROTECTED_GROUPS:
-            return
-
-        # Grup istatistiklerini güncelle
-        if chat_id not in self.stats.groups:
-            self.stats.groups[chat_id] = GroupStats()
-
-        self.stats.groups[chat_id].pending_count += 1
-
-        logger.info(f"Yeni istek geldi - Bekleyen: {self.stats.groups[chat_id].pending_count}")
-
-        # 20'yi geçtiyse otomatik temizle
-        await self.check_and_auto_clean()
 
     async def send_log(self, message: str):
         """Log grubuna mesaj gönder"""
