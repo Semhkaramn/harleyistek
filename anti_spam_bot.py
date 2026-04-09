@@ -99,7 +99,7 @@ class AntiSpamBot:
             )
 
         self.stats = stats
-        self.state = BotState.INACTIVE
+        self.state = BotState.ACTIVE
         self.clearing_in_progress = False
         self.me = None
 
@@ -125,7 +125,10 @@ class AntiSpamBot:
 
         logger.info(f"Korunan grup: {len(PROTECTED_GROUPS)}")
         logger.info(f"Log grubu: {LOG_CHANNEL_ID}")
-        logger.info("Bot KAPALI başladı. /ac komutu ile açın.")
+        logger.info("Bot AÇIK başladı.")
+
+        # Başlangıçta hemen kontrol et
+        await self.check_and_auto_clean()
 
         # Periyodik kontrol başlat
         asyncio.create_task(self.periodic_check())
