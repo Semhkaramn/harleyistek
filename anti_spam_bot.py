@@ -1,28 +1,25 @@
 """
 Telegram Anti-Spam Bot
 =======================
-Onaylı gruplarda spam join request'leri otomatik reddeder.
-3 saniye içinde 10+ istek gelirse flood olarak algılar ve hepsini reddeder.
+Onaylı gruplarda spam join request'leri yönetir.
+İstek sayısı 20'yi geçerse otomatik temizler.
 
-Komutlar:
-  /ac veya /on       - Botu aktif et
-  /kapat veya /off   - Botu kapat
-  /temizle veya /clear - Tüm bekleyen istekleri reddet
-  /durum veya /status  - Bot durumunu göster
+Komutlar (Log grubunda yazılır):
+  /ac       - Botu aktif et
+  /kapat    - Botu kapat
+  /temizle  - Tüm bekleyen istekleri reddet
 """
 
 import asyncio
 import os
-from datetime import datetime, timedelta
-from collections import deque
+from datetime import datetime
 from dataclasses import dataclass, field
-from typing import Dict, Deque, List
+from typing import Dict
 from enum import Enum
 import logging
 
 from telethon import TelegramClient, events
 from telethon.tl.functions.messages import HideChatJoinRequestRequest, GetChatInviteImportersRequest
-from telethon.tl.types import PeerChannel
 from dotenv import load_dotenv
 
 # .env dosyasını yükle
@@ -39,18 +36,11 @@ SESSION_STRING = os.getenv("SESSION_STRING", "")
 # Korunan grup ID'leri (birden fazla grup ekleyebilirsiniz)
 PROTECTED_GROUPS = [int(x.strip()) for x in os.getenv("PROTECTED_GROUPS", "").split(",") if x.strip()]
 
-# Log kanalı ID'si (istatistikler buraya gönderilecek)
+# Log grubu ID'si (komutlar buradan alınır, loglar buraya gönderilir)
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 
-# Admin kullanıcı ID'leri (komut verebilecek kişiler)
-ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-
-# Flood ayarları
-FLOOD_WINDOW_SECONDS = int(os.getenv("FLOOD_WINDOW_SECONDS", "3"))
-FLOOD_THRESHOLD = int(os.getenv("FLOOD_THRESHOLD", "10"))
-
-# İstatistik özet aralığı (saniye)
-STATS_INTERVAL = int(os.getenv("STATS_INTERVAL", "3600"))
+# Otomatik temizleme eşiği
+AUTO_CLEAN_THRESHOLD = 20
 
 # ═══════════════════════════════════════════════════════════════
 # LOGGING AYARLARI
@@ -69,36 +59,19 @@ logger = logging.getLogger(__name__)
 
 class BotState(Enum):
     """Bot durumları"""
-    ACTIVE = "active"      # Aktif - flood algılama açık
-    INACTIVE = "inactive"  # Pasif - hiçbir şey yapmaz
-    CLEARING = "clearing"  # Temizleme - istekleri reddediyor
-
-@dataclass
-class RequestInfo:
-    """Tek bir join request bilgisi"""
-    user_id: int
-    username: str
-    first_name: str
-    timestamp: datetime
-    chat_id: int
-    chat_title: str
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+    CLEARING = "clearing"
 
 @dataclass
 class GroupStats:
     """Grup bazlı istatistikler"""
-    total_requests: int = 0
-    rejected_requests: int = 0
-    flood_attacks: int = 0
-    last_flood_time: datetime = None
-    pending_requests: Deque[RequestInfo] = field(default_factory=deque)
+    pending_count: int = 0
 
 @dataclass
 class GlobalStats:
     """Genel istatistikler"""
-    start_time: datetime = field(default_factory=datetime.now)
-    total_requests: int = 0
     total_rejected: int = 0
-    total_flood_attacks: int = 0
     groups: Dict[int, GroupStats] = field(default_factory=dict)
 
 # Global değişkenler
@@ -112,7 +85,6 @@ class AntiSpamBot:
     def __init__(self):
         from telethon.sessions import StringSession
 
-        # Heroku için StringSession kullan (dosya tabanlı session çalışmaz)
         if SESSION_STRING:
             self.client = TelegramClient(
                 StringSession(SESSION_STRING),
@@ -120,7 +92,6 @@ class AntiSpamBot:
                 API_HASH
             )
         else:
-            # Local development için dosya tabanlı session
             self.client = TelegramClient(
                 "anti_spam_session",
                 API_ID,
@@ -128,25 +99,26 @@ class AntiSpamBot:
             )
 
         self.stats = stats
-        self.state = BotState.INACTIVE  # Başlangıçta kapalı
-        self.flood_in_progress: Dict[int, bool] = {}
+        self.state = BotState.INACTIVE
         self.clearing_in_progress = False
         self.me = None
 
     async def start(self):
         """Botu başlat"""
-        logger.info("🚀 Bot başlatılıyor...")
+        logger.info("Bot başlatılıyor...")
 
-        # Bağlan
         await self.client.start()
 
         self.me = await self.client.get_me()
-        logger.info(f"✅ Giriş yapıldı: @{self.me.username} ({self.me.first_name})")
+        logger.info(f"Giriş yapıldı: @{self.me.username} ({self.me.first_name})")
 
-        # Komut handler'ları kaydet
+        # Komut handler - SADECE LOG GRUBUNDAN
         self.client.add_event_handler(
             self.on_command,
-            events.NewMessage(pattern=r'^/(ac|on|kapat|off|temizle|clear|durum|status)$')
+            events.NewMessage(
+                chats=[LOG_CHANNEL_ID],
+                pattern=r'^/(ac|kapat|temizle)$'
+            )
         )
 
         # Raw update handler for join requests
@@ -155,196 +127,100 @@ class AntiSpamBot:
             events.Raw()
         )
 
-        # Başlangıç mesajı gönder
-        await self.send_log(
-            "🟡 **Bot Başlatıldı (KAPALI)**\n\n"
-            f"👤 Hesap: @{self.me.username}\n"
-            f"🛡️ Korunan Grup: {len(PROTECTED_GROUPS)}\n"
-            f"⏱️ Flood Penceresi: {FLOOD_WINDOW_SECONDS}s\n"
-            f"🚫 Flood Eşiği: {FLOOD_THRESHOLD} istek\n\n"
-            f"📝 **Komutlar:**\n"
-            f"`/ac` - Botu aç\n"
-            f"`/kapat` - Botu kapat\n"
-            f"`/temizle` - İstekleri temizle\n"
-            f"`/durum` - Durumu göster"
-        )
-
-        # Periyodik istatistik gönderimi başlat
-        asyncio.create_task(self.periodic_stats())
-
-        logger.info(f"🛡️ {len(PROTECTED_GROUPS)} grup ayarlandı")
-        logger.info(f"⏱️ Flood: {FLOOD_WINDOW_SECONDS}s içinde {FLOOD_THRESHOLD} istek")
-        logger.info("⚠️ Bot KAPALI başladı. /ac komutu ile açın.")
+        logger.info(f"Korunan grup: {len(PROTECTED_GROUPS)}")
+        logger.info(f"Log grubu: {LOG_CHANNEL_ID}")
+        logger.info("Bot KAPALI başladı. /ac komutu ile açın.")
 
         await self.client.run_until_disconnected()
 
     async def on_command(self, event):
-        """Komut handler"""
-        sender = await event.get_sender()
-        user_id = sender.id
-
-        # Admin kontrolü
-        if ADMIN_IDS and user_id not in ADMIN_IDS:
-            return
-
-        # Kendi mesajlarımızı da kabul et
-        if user_id != self.me.id and ADMIN_IDS and user_id not in ADMIN_IDS:
-            return
-
+        """Komut handler - Sadece log grubundan"""
         command = event.text.lower().strip('/')
-        chat = await event.get_chat()
 
         # ═══════════════════════════════════════════════════════
-        # /ac veya /on - Botu aktif et
+        # /ac - Botu aktif et
         # ═══════════════════════════════════════════════════════
-        if command in ['ac', 'on']:
+        if command == 'ac':
             if self.state == BotState.ACTIVE:
-                await event.reply("⚠️ Bot zaten **aktif**!")
+                await event.reply("Bot zaten aktif!")
                 return
 
             if self.state == BotState.CLEARING:
-                await event.reply("⚠️ Temizleme devam ediyor, bekleyin...")
+                await event.reply("Temizleme devam ediyor, bekleyin...")
                 return
 
             self.state = BotState.ACTIVE
-            logger.info(f"🟢 Bot AKTİF edildi - {sender.first_name}")
+            logger.info("Bot AKTİF edildi")
+            await event.reply("🟢 Bot aktif!")
 
-            await event.reply(
-                "🟢 **Bot AKTİF**\n\n"
-                f"⏱️ {FLOOD_WINDOW_SECONDS}s içinde {FLOOD_THRESHOLD}+ istek = Otomatik RED\n"
-                "🛡️ Flood koruması çalışıyor..."
-            )
-
-            await self.send_log(
-                f"🟢 **Bot AKTİF EDİLDİ**\n\n"
-                f"👤 Aktif eden: [{sender.first_name}](tg://user?id={user_id})\n"
-                f"⏱️ Zaman: {datetime.now().strftime('%H:%M:%S')}"
-            )
+            # Açılınca hemen 20+ kontrol et
+            await self.check_and_auto_clean()
 
         # ═══════════════════════════════════════════════════════
-        # /kapat veya /off - Botu kapat
+        # /kapat - Botu kapat
         # ═══════════════════════════════════════════════════════
-        elif command in ['kapat', 'off']:
+        elif command == 'kapat':
             if self.state == BotState.INACTIVE:
-                await event.reply("⚠️ Bot zaten **kapalı**!")
+                await event.reply("Bot zaten kapalı!")
                 return
 
             if self.state == BotState.CLEARING:
-                await event.reply("⚠️ Temizleme devam ediyor, bekleyin...")
+                await event.reply("Temizleme devam ediyor, bekleyin...")
                 return
 
             self.state = BotState.INACTIVE
-            logger.info(f"🔴 Bot KAPATILDI - {sender.first_name}")
-
-            await event.reply(
-                "🔴 **Bot KAPALI**\n\n"
-                "⏸️ Hiçbir işlem yapılmıyor.\n"
-                "📝 Açmak için: `/ac`"
-            )
-
-            await self.send_log(
-                f"🔴 **Bot KAPATILDI**\n\n"
-                f"👤 Kapatan: [{sender.first_name}](tg://user?id={user_id})\n"
-                f"⏱️ Zaman: {datetime.now().strftime('%H:%M:%S')}"
-            )
+            logger.info("Bot KAPATILDI")
+            await event.reply("🔴 Bot kapatıldı!")
 
         # ═══════════════════════════════════════════════════════
-        # /temizle veya /clear - Tüm istekleri reddet
+        # /temizle - Tüm istekleri reddet
         # ═══════════════════════════════════════════════════════
-        elif command in ['temizle', 'clear']:
+        elif command == 'temizle':
             if self.clearing_in_progress:
-                await event.reply("⚠️ Temizleme zaten devam ediyor...")
+                await event.reply("Temizleme zaten devam ediyor...")
                 return
 
-            previous_state = self.state
-            self.state = BotState.CLEARING
-            self.clearing_in_progress = True
+            await self.do_cleanup(manual=True)
 
-            status_msg = await event.reply(
-                "🧹 **Temizleme Başlatıldı**\n\n"
-                "🔄 Tüm bekleyen istekler reddediliyor...\n"
-                "⏳ Lütfen bekleyin..."
-            )
+    async def do_cleanup(self, manual=False):
+        """Tüm istekleri temizle"""
+        if self.clearing_in_progress:
+            return
 
-            logger.info(f"🧹 Temizleme başlatıldı - {sender.first_name}")
+        previous_state = self.state
+        self.state = BotState.CLEARING
+        self.clearing_in_progress = True
 
-            await self.send_log(
-                f"🧹 **TEMİZLEME BAŞLATILDI**\n\n"
-                f"👤 Başlatan: [{sender.first_name}](tg://user?id={user_id})\n"
-                f"⏱️ Zaman: {datetime.now().strftime('%H:%M:%S')}"
-            )
+        logger.info("Temizleme başlatıldı")
 
-            # Tüm gruplardaki istekleri temizle
-            total_rejected = 0
-            for group_id in PROTECTED_GROUPS:
-                rejected = await self.clear_all_requests(group_id)
-                total_rejected += rejected
-
-            self.clearing_in_progress = False
-            self.state = BotState.INACTIVE  # Temizlik bitince KAPALI duruma geç
-
-            await status_msg.edit(
-                f"✅ **Temizleme Tamamlandı**\n\n"
-                f"🚫 Reddedilen: **{total_rejected}** istek\n"
-                f"🔴 Bot şu an **KAPALI**\n"
-                f"📝 Açmak için: `/ac`"
-            )
-
-            await self.send_log(
-                f"✅ **TEMİZLEME TAMAMLANDI**\n\n"
-                f"🚫 Reddedilen: **{total_rejected}** istek\n"
-                f"🔴 Bot durumu: KAPALI\n"
-                f"⏱️ Zaman: {datetime.now().strftime('%H:%M:%S')}"
-            )
-
-            logger.info(f"✅ Temizleme tamamlandı - {total_rejected} istek reddedildi")
-
-        # ═══════════════════════════════════════════════════════
-        # /durum veya /status - Bot durumunu göster
-        # ═══════════════════════════════════════════════════════
-        elif command in ['durum', 'status']:
-            state_emoji = {
-                BotState.ACTIVE: "🟢 AKTİF",
-                BotState.INACTIVE: "🔴 KAPALI",
-                BotState.CLEARING: "🧹 TEMİZLİYOR"
-            }
-
-            uptime = datetime.now() - self.stats.start_time
-            hours, remainder = divmod(int(uptime.total_seconds()), 3600)
-            minutes, seconds = divmod(remainder, 60)
-
-            await event.reply(
-                f"📊 **Bot Durumu**\n\n"
-                f"**Durum:** {state_emoji[self.state]}\n"
-                f"**Çalışma Süresi:** {hours}s {minutes}dk {seconds}sn\n\n"
-                f"**📈 İstatistikler:**\n"
-                f"├ Toplam İstek: {self.stats.total_requests}\n"
-                f"├ Reddedilen: {self.stats.total_rejected}\n"
-                f"├ Flood Saldırısı: {self.stats.total_flood_attacks}\n"
-                f"└ Onay Oranı: {self.calculate_approval_rate():.1f}%\n\n"
-                f"**⚙️ Ayarlar:**\n"
-                f"├ Flood Penceresi: {FLOOD_WINDOW_SECONDS}s\n"
-                f"└ Flood Eşiği: {FLOOD_THRESHOLD} istek"
-            )
-
-    async def clear_all_requests(self, chat_id: int, status_callback=None) -> int:
-        """Bir gruptaki tüm bekleyen istekleri reddet - HEPSİ BİTENE KADAR"""
+        # Tüm gruplardaki istekleri temizle
         total_rejected = 0
-        pass_count = 0
+        for group_id in PROTECTED_GROUPS:
+            rejected = await self.clear_all_requests(group_id)
+            total_rejected += rejected
+
+        self.clearing_in_progress = False
+        self.state = previous_state if not manual else BotState.INACTIVE
+
+        # SADECE TEMİZLEME BİTİNCE LOG GÖNDER
+        if total_rejected > 0:
+            await self.send_log(f"✅ {total_rejected} istek temizlendi")
+        else:
+            await self.send_log("✅ Temizlendi (bekleyen istek yoktu)")
+
+        logger.info(f"Temizleme tamamlandı - {total_rejected} istek reddedildi")
+
+    async def clear_all_requests(self, chat_id: int) -> int:
+        """Bir gruptaki tüm bekleyen istekleri reddet"""
+        total_rejected = 0
 
         try:
-            # Grup entity'sini al
             chat = await self.client.get_entity(chat_id)
             chat_title = chat.title if hasattr(chat, 'title') else f"Grup {chat_id}"
 
-            logger.info(f"🧹 {chat_title} temizleniyor...")
+            logger.info(f"{chat_title} temizleniyor...")
 
-            # HEPSİ BİTENE KADAR DEVAM ET
             while True:
-                pass_count += 1
-                found_any = False
-
-                # Her seferinde baştan al (offset kullanma - yeni gelenler de olabilir)
                 try:
                     result = await self.client(GetChatInviteImportersRequest(
                         peer=chat_id,
@@ -356,15 +232,9 @@ class AntiSpamBot:
                     ))
 
                     if not result.importers:
-                        logger.info(f"✅ {chat_title} - Bekleyen istek kalmadı!")
                         break
 
-                    found_any = True
-                    batch_count = len(result.importers)
-                    logger.info(f"📋 Pass {pass_count}: {batch_count} istek bulundu")
-
-                    # Tüm istekleri hızlıca reddet
-                    for i, importer in enumerate(result.importers):
+                    for importer in result.importers:
                         try:
                             await self.client(HideChatJoinRequestRequest(
                                 peer=chat_id,
@@ -375,57 +245,78 @@ class AntiSpamBot:
                             total_rejected += 1
                             self.stats.total_rejected += 1
 
-                            # Grup istatistiklerini güncelle
-                            if chat_id in self.stats.groups:
-                                self.stats.groups[chat_id].rejected_requests += 1
-
-                            # Her 10 istekte bir log
                             if total_rejected % 10 == 0:
-                                logger.info(f"🚫 {total_rejected} istek reddedildi...")
+                                logger.info(f"{total_rejected} istek reddedildi...")
 
-                            # Çok kısa bekleme (rate limit için minimal)
                             await asyncio.sleep(0.03)
 
                         except Exception as e:
                             if "HIDE_REQUESTER_MISSING" in str(e):
-                                # İstek zaten işlenmiş, devam et
                                 continue
-                            logger.error(f"❌ Red hatası: {e}")
+                            logger.error(f"Red hatası: {e}")
                             await asyncio.sleep(0.1)
 
                 except Exception as e:
                     error_str = str(e)
                     if "FLOOD_WAIT" in error_str:
-                        # FloodWait hatası - bekle ve devam et
                         import re
                         wait_match = re.search(r'(\d+)', error_str)
                         wait_time = int(wait_match.group(1)) if wait_match else 5
-                        logger.warning(f"⏳ FloodWait: {wait_time} saniye bekleniyor...")
+                        logger.warning(f"FloodWait: {wait_time} saniye bekleniyor...")
                         await asyncio.sleep(wait_time)
                         continue
                     else:
-                        logger.error(f"❌ İstek listesi hatası: {e}")
-                        await asyncio.sleep(1)
-                        continue
+                        logger.error(f"İstek listesi hatası: {e}")
+                        break
 
-                # Eğer hiç istek bulamadıysak çık
-                if not found_any:
-                    break
-
-                # Kısa bir mola ver ve tekrar kontrol et
                 await asyncio.sleep(0.5)
 
         except Exception as e:
-            logger.error(f"❌ Grup erişim hatası {chat_id}: {e}")
+            logger.error(f"Grup erişim hatası {chat_id}: {e}")
 
-        logger.info(f"✅ {chat_title} temizlendi: {total_rejected} istek reddedildi")
+        # Grup pending count'u sıfırla
+        if chat_id in self.stats.groups:
+            self.stats.groups[chat_id].pending_count = 0
+
         return total_rejected
+
+    async def get_pending_count(self, chat_id: int) -> int:
+        """Bekleyen istek sayısını al"""
+        try:
+            result = await self.client(GetChatInviteImportersRequest(
+                peer=chat_id,
+                requested=True,
+                limit=1,
+                offset_date=None,
+                offset_user=0,
+                q=""
+            ))
+            return result.count if hasattr(result, 'count') else len(result.importers)
+        except:
+            return 0
+
+    async def check_and_auto_clean(self):
+        """20'yi geçerse otomatik temizle"""
+        if self.state != BotState.ACTIVE or self.clearing_in_progress:
+            return
+
+        total_pending = 0
+        for group_id in PROTECTED_GROUPS:
+            count = await self.get_pending_count(group_id)
+            total_pending += count
+
+            if group_id not in self.stats.groups:
+                self.stats.groups[group_id] = GroupStats()
+            self.stats.groups[group_id].pending_count = count
+
+        if total_pending > AUTO_CLEAN_THRESHOLD:
+            logger.info(f"Otomatik temizleme tetiklendi: {total_pending} istek")
+            await self.do_cleanup(manual=False)
 
     async def on_raw_update(self, event):
         """Raw update handler - Join Request'leri yakalar"""
         from telethon.tl.types import UpdateBotChatInviteRequester
 
-        # Bot kapalıysa veya temizlik yapılıyorsa hiçbir şey yapma
         if self.state != BotState.ACTIVE:
             return
 
@@ -436,214 +327,28 @@ class AntiSpamBot:
 
         # Korunan gruplardan biri mi kontrol et
         if PROTECTED_GROUPS and chat_id not in PROTECTED_GROUPS and -100*chat_id not in PROTECTED_GROUPS:
-            if PROTECTED_GROUPS:
-                return
-
-        user = event.user_id
-
-        try:
-            user_entity = await self.client.get_entity(user)
-            username = user_entity.username or "Yok"
-            first_name = user_entity.first_name or "Bilinmiyor"
-        except:
-            username = "Bilinmiyor"
-            first_name = "Bilinmiyor"
-
-        try:
-            chat_entity = await self.client.get_entity(chat_id)
-            chat_title = chat_entity.title
-        except:
-            chat_title = f"Grup {chat_id}"
-
-        # İstek bilgisini oluştur
-        request_info = RequestInfo(
-            user_id=user,
-            username=username,
-            first_name=first_name,
-            timestamp=datetime.now(),
-            chat_id=chat_id,
-            chat_title=chat_title
-        )
-
-        await self.process_join_request(request_info, event)
-
-    async def process_join_request(self, request: RequestInfo, raw_event):
-        """Join request'i işle"""
-        # Bot aktif değilse çık
-        if self.state != BotState.ACTIVE:
             return
 
-        chat_id = request.chat_id
-
-        # Grup istatistiklerini al veya oluştur
+        # Grup istatistiklerini güncelle
         if chat_id not in self.stats.groups:
             self.stats.groups[chat_id] = GroupStats()
 
-        group_stats = self.stats.groups[chat_id]
+        self.stats.groups[chat_id].pending_count += 1
 
-        # İstatistikleri güncelle
-        self.stats.total_requests += 1
-        group_stats.total_requests += 1
+        logger.info(f"Yeni istek geldi - Bekleyen: {self.stats.groups[chat_id].pending_count}")
 
-        # Eski istekleri temizle (pencere dışındakiler)
-        current_time = datetime.now()
-        cutoff_time = current_time - timedelta(seconds=FLOOD_WINDOW_SECONDS)
-
-        while group_stats.pending_requests and group_stats.pending_requests[0].timestamp < cutoff_time:
-            group_stats.pending_requests.popleft()
-
-        # Yeni isteği ekle
-        group_stats.pending_requests.append(request)
-
-        pending_count = len(group_stats.pending_requests)
-
-        logger.info(
-            f"📥 Yeni istek: @{request.username} ({request.first_name}) "
-            f"-> {request.chat_title} | Pencerede: {pending_count}/{FLOOD_THRESHOLD}"
-        )
-
-        # Flood kontrolü
-        if pending_count >= FLOOD_THRESHOLD:
-            if not self.flood_in_progress.get(chat_id, False):
-                self.flood_in_progress[chat_id] = True
-                group_stats.flood_attacks += 1
-                self.stats.total_flood_attacks += 1
-                group_stats.last_flood_time = current_time
-
-                logger.warning(f"🚨 FLOOD TESPİT! {request.chat_title} - {pending_count} istek")
-
-                # Log kanalına bildir
-                await self.send_log(
-                    f"🚨 **FLOOD TESPİT EDİLDİ!**\n\n"
-                    f"📍 Grup: **{request.chat_title}**\n"
-                    f"⏱️ Süre: {FLOOD_WINDOW_SECONDS} saniye içinde\n"
-                    f"📊 İstek Sayısı: **{pending_count}**\n"
-                    f"🔄 Tüm istekler reddediliyor..."
-                )
-
-                # Penceredeki istekleri reddet
-                rejected_count = await self.reject_pending_requests(chat_id)
-
-                await self.send_log(
-                    f"✅ **Flood Engellendi**\n\n"
-                    f"📍 Grup: **{request.chat_title}**\n"
-                    f"🚫 Reddedilen: **{rejected_count}** istek\n"
-                    f"⏱️ Zaman: {current_time.strftime('%H:%M:%S')}\n\n"
-                    f"🔴 Bot durumu: **KAPALI**\n"
-                    f"📝 Tekrar açmak için: `/ac`"
-                )
-
-                # Flood bitti, botu kapat
-                self.flood_in_progress[chat_id] = False
-                self.state = BotState.INACTIVE
-
-                logger.info("🔴 Flood engellendi, bot KAPALI duruma geçti")
-
-    async def reject_pending_requests(self, chat_id: int) -> int:
-        """Penceredeki bekleyen istekleri reddet"""
-        group_stats = self.stats.groups[chat_id]
-        rejected_count = 0
-
-        while group_stats.pending_requests:
-            request = group_stats.pending_requests.popleft()
-
-            try:
-                await self.client(HideChatJoinRequestRequest(
-                    peer=chat_id,
-                    user_id=request.user_id,
-                    approved=False
-                ))
-
-                rejected_count += 1
-                group_stats.rejected_requests += 1
-                self.stats.total_rejected += 1
-
-                logger.info(f"🚫 Reddedildi: @{request.username} ({request.first_name})")
-
-                # Rate limit koruması
-                await asyncio.sleep(0.1)
-
-            except Exception as e:
-                logger.error(f"❌ Red hatası: {e}")
-
-        return rejected_count
+        # 20'yi geçtiyse otomatik temizle
+        await self.check_and_auto_clean()
 
     async def send_log(self, message: str):
-        """Log kanalına mesaj gönder"""
+        """Log grubuna mesaj gönder"""
         if not LOG_CHANNEL_ID:
             return
 
         try:
-            await self.client.send_message(
-                LOG_CHANNEL_ID,
-                message,
-                parse_mode='markdown'
-            )
+            await self.client.send_message(LOG_CHANNEL_ID, message)
         except Exception as e:
-            logger.error(f"❌ Log gönderme hatası: {e}")
-
-    async def periodic_stats(self):
-        """Periyodik istatistik özeti gönder"""
-        while True:
-            await asyncio.sleep(STATS_INTERVAL)
-
-            # Sadece bot aktifse rapor gönder
-            if self.state == BotState.INACTIVE:
-                continue
-
-            uptime = datetime.now() - self.stats.start_time
-            hours, remainder = divmod(int(uptime.total_seconds()), 3600)
-            minutes, seconds = divmod(remainder, 60)
-
-            state_emoji = {
-                BotState.ACTIVE: "🟢 AKTİF",
-                BotState.INACTIVE: "🔴 KAPALI",
-                BotState.CLEARING: "🧹 TEMİZLİYOR"
-            }
-
-            # Grup bazlı istatistikler
-            group_stats_text = ""
-            for gid, gstats in self.stats.groups.items():
-                if gstats.total_requests > 0:
-                    try:
-                        chat = await self.client.get_entity(gid)
-                        chat_name = chat.title
-                    except:
-                        chat_name = f"Grup {gid}"
-
-                    group_stats_text += (
-                        f"\n📍 **{chat_name}**\n"
-                        f"   • Toplam: {gstats.total_requests}\n"
-                        f"   • Reddedilen: {gstats.rejected_requests}\n"
-                        f"   • Flood: {gstats.flood_attacks}\n"
-                    )
-
-            if not group_stats_text:
-                group_stats_text = "\n_Henüz istek gelmedi_"
-
-            stats_message = (
-                f"📊 **PERİYODİK RAPOR**\n"
-                f"{'═' * 25}\n\n"
-                f"**Durum:** {state_emoji[self.state]}\n"
-                f"⏱️ Çalışma: {hours}s {minutes}dk\n"
-                f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
-                f"**📈 GENEL**\n"
-                f"├ Toplam İstek: **{self.stats.total_requests}**\n"
-                f"├ Reddedilen: **{self.stats.total_rejected}**\n"
-                f"├ Flood: **{self.stats.total_flood_attacks}**\n"
-                f"└ Onay: **{self.calculate_approval_rate():.1f}%**\n\n"
-                f"**📍 GRUPLAR**{group_stats_text}"
-            )
-
-            await self.send_log(stats_message)
-            logger.info("📊 Periyodik rapor gönderildi")
-
-    def calculate_approval_rate(self) -> float:
-        """Onay oranını hesapla"""
-        if self.stats.total_requests == 0:
-            return 100.0
-        approved = self.stats.total_requests - self.stats.total_rejected
-        return (approved / self.stats.total_requests) * 100
+            logger.error(f"Log gönderme hatası: {e}")
 
 # ═══════════════════════════════════════════════════════════════
 # ANA FONKSİYON
@@ -652,17 +357,15 @@ class AntiSpamBot:
 async def main():
     """Ana fonksiyon"""
     if not API_ID or not API_HASH:
-        logger.error("❌ API_ID ve API_HASH ayarlanmamış!")
+        logger.error("API_ID ve API_HASH ayarlanmamış!")
         return
 
     if not LOG_CHANNEL_ID:
-        logger.warning("⚠️ LOG_CHANNEL_ID ayarlanmamış")
+        logger.error("LOG_CHANNEL_ID ayarlanmamış!")
+        return
 
     if not PROTECTED_GROUPS:
-        logger.warning("⚠️ PROTECTED_GROUPS boş, tüm gruplar korunacak")
-
-    if not ADMIN_IDS:
-        logger.warning("⚠️ ADMIN_IDS boş, sadece hesap sahibi komut verebilir")
+        logger.warning("PROTECTED_GROUPS boş")
 
     bot = AntiSpamBot()
     await bot.start()
@@ -670,13 +373,14 @@ async def main():
 if __name__ == "__main__":
     print("""
     ╔═══════════════════════════════════════════════════════════╗
-    ║          🛡️  TELEGRAM ANTI-SPAM BOT  🛡️                  ║
+    ║          TELEGRAM ANTI-SPAM BOT                           ║
     ╠═══════════════════════════════════════════════════════════╣
-    ║  Komutlar:                                                ║
+    ║  Komutlar (Log grubunda yazılır):                         ║
     ║    /ac      - Botu aktif et                               ║
     ║    /kapat   - Botu kapat                                  ║
     ║    /temizle - Tüm istekleri reddet                        ║
-    ║    /durum   - Durumu göster                               ║
+    ║                                                           ║
+    ║  20+ istek = Otomatik temizleme                           ║
     ╚═══════════════════════════════════════════════════════════╝
     """)
     asyncio.run(main())
