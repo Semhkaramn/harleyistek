@@ -123,7 +123,16 @@ class AntiSpamBot:
             )
         )
 
-
+        # Müzik bot komut handler - KORUNAN GRUPLARDAN
+        # "atla" veya "dur" yazıldığında müzik botu komutlarını gönderir
+        if PROTECTED_GROUPS:
+            self.client.add_event_handler(
+                self.on_music_command,
+                events.NewMessage(
+                    chats=PROTECTED_GROUPS,
+                    pattern=r'^(atla|dur)$'
+                )
+            )
 
         logger.info(f"Korunan grup: {len(PROTECTED_GROUPS)}")
         logger.info(f"Log grubu: {LOG_CHANNEL_ID}")
@@ -136,6 +145,15 @@ class AntiSpamBot:
         asyncio.create_task(self.periodic_check())
 
         await self.client.run_until_disconnected()
+
+    async def on_music_command(self, event):
+        """Müzik bot komut handler - Korunan gruplardan"""
+        command = event.text.lower().strip()
+
+        if command == 'atla':
+            await event.respond("/atla@AlemMuzikBot")
+        elif command == 'dur':
+            await event.respond("/dur@AlemMuzikBot")
 
     async def periodic_check(self):
         """Her 10 saniyede bir istek sayısını kontrol et"""
