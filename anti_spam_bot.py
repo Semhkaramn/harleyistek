@@ -637,7 +637,7 @@ class AntiSpamBot:
     # ═══════════════════════════════════════════════════════════════
 
     async def periodic_announcement_check(self):
-        """Her 3 saniyede bir duyuru kanallarını kontrol et"""
+        """Her 1 saniyede bir duyuru kanallarını kontrol et"""
         logger.info("🔄 Duyuru kanalları periyodik kontrol başlatıldı...")
 
         # İlk çalıştırmada mevcut üyeleri kaydet (bunları engellemeyeceğiz)
@@ -645,7 +645,7 @@ class AntiSpamBot:
 
         while True:
             try:
-                await asyncio.sleep(3)  # 3 saniyede bir kontrol
+                await asyncio.sleep(1)  # 1 saniyede bir kontrol - HIZLI
 
                 for set_id, data in self.announcement_sets.items():
                     for channel_id in data['channels']:
@@ -718,53 +718,75 @@ class AntiSpamBot:
             if new_members_count > 0:
                 logger.info(f"🔔 {stats.channel_name}: +{new_members_count} yeni üye! (Toplam: {current_count})")
 
-                # Yeni üyeleri al (son eklenenler - recent participants)
+                # TÜM yeni üyeleri al (30k bile olsa - döngüyle)
                 try:
                     from telethon.tl.types import ChannelParticipantsRecent
-                    participants = await self.client.get_participants(
-                        channel_id,
-                        filter=ChannelParticipantsRecent(),
-                        limit=min(new_members_count + 20, 100)
-                    )
+
+                    all_participants = []
+                    offset = 0
+                    fetch_limit = 200  # Her seferde 200
+
+                    # Döngüyle tüm yeni üyeleri çek
+                    while True:
+                        participants = await self.client.get_participants(
+                            channel_id,
+                            filter=ChannelParticipantsRecent(),
+                            limit=fetch_limit,
+                            offset=offset
+                        )
+
+                        if not participants:
+                            break
+
+                        all_participants.extend(participants)
+
+                        # Yeterli aldık mı?
+                        if len(participants) < fetch_limit or len(all_participants) >= new_members_count + 100:
+                            break
+
+                        offset += fetch_limit
+                        await asyncio.sleep(0.01)  # Minimal bekleme
 
                     # Yeni üyeleri tespit et
                     new_user_ids = []
-                    for p in participants:
+                    for p in all_participants:
                         if p.id not in stats.known_user_ids:
                             new_user_ids.append(p.id)
                             stats.known_user_ids.add(p.id)
 
                     if new_user_ids:
-                        logger.info(f"🆕 {len(new_user_ids)} yeni kullanıcı tespit edildi")
+                        logger.info(f"🆕 {len(new_user_ids)} yeni kullanıcı")
 
-                        # Katılımları kaydet
-                        for user_id in new_user_ids:
-                            stats.recent_joins.append({
-                                'user_id': user_id,
-                                'time': current_time
-                            })
+                        # Recent joins'e ekle (saldırı takibi için)
+                        for uid in new_user_ids:
+                            stats.recent_joins.append({'user_id': uid, 'time': current_time})
 
                         # Eski kayıtları temizle
                         cutoff_time = current_time - MASS_JOIN_WINDOW
                         while stats.recent_joins and stats.recent_joins[0]['time'] < cutoff_time:
                             stats.recent_joins.popleft()
 
-                        recent_count = len(stats.recent_joins)
-                        logger.info(f"📈 Son {MASS_JOIN_WINDOW}sn: {recent_count} katılım (Eşik: {MASS_JOIN_THRESHOLD})")
+                        # Saldırı kontrolü - HEMEN engelle
+                        if len(new_user_ids) >= MASS_JOIN_THRESHOLD or stats.attack_mode:
+                            if not stats.attack_mode:
+                                stats.attack_mode = True
+                                stats.attack_start_time = time.time()
+                                stats.banned_in_current_attack = 0
+                                await self.send_announcement_log(
+                                    set_id, channel_id,
+                                    f"🚨 {stats.channel_name} - Bot saldırısı!"
+                                )
+                                logger.warning(f"🚨 BOT SALDIRISI: {stats.channel_name}")
 
-                        # Saldırı kontrolü
-                        if recent_count >= MASS_JOIN_THRESHOLD:
-                            await self.handle_mass_join_attack(set_id, channel_id, stats, new_user_ids)
-                        elif stats.attack_mode:
-                            # Saldırı modundayken gelen tüm yeni üyeleri HIZLI engelle
+                            # HEMEN engelle
                             await self.ban_users_fast(channel_id, new_user_ids, set_id, stats)
 
-                            # Saldırı bitmiş mi kontrol et
-                            if recent_count < MASS_JOIN_THRESHOLD // 2:
-                                await self.end_attack_mode(set_id, channel_id, stats)
+                        # Saldırı bitti mi? (5sn yeni giriş yoksa)
+                        if stats.attack_mode and len(stats.recent_joins) < MASS_JOIN_THRESHOLD // 2:
+                            await self.end_attack_mode(set_id, channel_id, stats)
 
                 except Exception as e:
-                    logger.error(f"Üye listesi alma hatası: {e}")
+                    logger.error(f"Üye listesi hatası: {e}")
 
             # Güncelle
             stats.last_known_count = current_count
@@ -782,22 +804,8 @@ class AntiSpamBot:
                 logger.error(f"Kanal kontrol hatası {channel_id}: {e}")
 
     async def handle_mass_join_attack(self, set_id: int, channel_id: int, stats: AnnouncementChannelStats, new_user_ids: list):
-        """Toplu katılım saldırısını işle"""
-        if not stats.attack_mode:
-            # Saldırı başladı!
-            stats.attack_mode = True
-            stats.attack_start_time = time.time()
-            stats.banned_in_current_attack = 0
-
-            await self.send_announcement_log(
-                set_id,
-                channel_id,
-                f"🚨 {stats.channel_name} - Bot saldırısı!"
-            )
-            logger.warning(f"🚨 BOT SALDIRISI: {stats.channel_name}")
-
-        # Tüm yeni üyeleri HIZLI engelle (paralel)
-        await self.ban_users_fast(channel_id, new_user_ids, set_id, stats)
+        """Toplu katılım saldırısını işle - Artık ana döngüde işleniyor"""
+        pass  # Mantık check_channel_for_new_members'a taşındı
 
     async def end_attack_mode(self, set_id: int, channel_id: int, stats: AnnouncementChannelStats):
         """Saldırı modunu sonlandır"""
@@ -860,8 +868,8 @@ class AntiSpamBot:
                         return False
                 return False
 
-        # Tüm banları paralel çalıştır (10'lu gruplar halinde)
-        batch_size = 10
+        # Tüm banları paralel çalıştır (50'li gruplar halinde - HIZLI)
+        batch_size = 50
         total_banned = 0
 
         for i in range(0, len(user_ids), batch_size):
@@ -874,9 +882,9 @@ class AntiSpamBot:
             stats.total_banned += banned_count
             stats.banned_in_current_attack += banned_count
 
-            # Kısa bekleme (rate limit)
+            # Minimal bekleme
             if i + batch_size < len(user_ids):
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.01)
 
         if total_banned > 0:
             logger.info(f"🚫 {total_banned} hesap engellendi")
