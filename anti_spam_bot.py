@@ -265,7 +265,7 @@ class AntiSpamBot:
                 self.on_command,
                 events.NewMessage(
                     chats=all_log_channels,
-                    pattern=r'^/(ac|kapat|temizle|durum|esik)(\s+.*)?
+                    pattern=r'^/(ac|kapat|temizle|durum|esik)(\s+.*)?$'
                 )
             )
 
