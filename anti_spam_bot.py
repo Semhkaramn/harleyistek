@@ -718,38 +718,21 @@ class AntiSpamBot:
             if new_members_count > 0:
                 logger.info(f"🔔 {stats.channel_name}: +{new_members_count} yeni üye! (Toplam: {current_count})")
 
-                # TÜM yeni üyeleri al (30k bile olsa - döngüyle)
+                # TÜM yeni üyeleri al
                 try:
                     from telethon.tl.types import ChannelParticipantsRecent
 
-                    all_participants = []
-                    offset = 0
-                    fetch_limit = 200  # Her seferde 200
-
-                    # Döngüyle tüm yeni üyeleri çek
-                    while True:
-                        participants = await self.client.get_participants(
-                            channel_id,
-                            filter=ChannelParticipantsRecent(),
-                            limit=fetch_limit,
-                            offset=offset
-                        )
-
-                        if not participants:
-                            break
-
-                        all_participants.extend(participants)
-
-                        # Yeterli aldık mı?
-                        if len(participants) < fetch_limit or len(all_participants) >= new_members_count + 100:
-                            break
-
-                        offset += fetch_limit
-                        await asyncio.sleep(0.01)  # Minimal bekleme
+                    # Yeterli sayıda üye çek (limit=0 hepsini çeker)
+                    fetch_limit = max(new_members_count + 100, 1000)
+                    participants = await self.client.get_participants(
+                        channel_id,
+                        filter=ChannelParticipantsRecent(),
+                        limit=fetch_limit
+                    )
 
                     # Yeni üyeleri tespit et
                     new_user_ids = []
-                    for p in all_participants:
+                    for p in participants:
                         if p.id not in stats.known_user_ids:
                             new_user_ids.append(p.id)
                             stats.known_user_ids.add(p.id)
