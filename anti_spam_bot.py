@@ -3,7 +3,16 @@ Telegram Anti-Spam Bot
 =======================
 2 ayrı grup seti ve 2 ayrı log grubu ile çalışır.
 Her log grubu kendi grubunu kontrol eder.
-İstek sayısı 20'yi geçerse otomatik temizler.
+
+ÖZELLİKLER:
+1. İSTEK KORUMASI (Gruplar):
+   - İstek sayısı 20'yi geçerse otomatik temizler
+   - /ac, /kapat, /temizle komutları
+
+2. BOT SALDIRISI KORUMASI (Duyuru Kanalları):
+   - 5 saniyede 10+ katılım = Bot saldırısı tespiti
+   - Tüm saldırganlar otomatik engellenir (ban)
+   - Saldırı bitene kadar koruma devam eder
 
 Komutlar (İlgili log grubunda yazılır):
   /ac       - Botu aktif et (o grup için)
@@ -21,6 +30,11 @@ import logging
 
 from telethon import TelegramClient, events
 from telethon.tl.functions.messages import HideChatJoinRequestRequest, GetChatInviteImportersRequest
+from telethon.tl.functions.channels import EditBannedRequest
+from telethon.tl.types import ChatBannedRights, ChannelParticipantsRecent
+from telethon.tl.functions.channels import GetParticipantsRequest
+from collections import deque
+import time
 from dotenv import load_dotenv
 
 # .env dosyasını yükle
@@ -44,6 +58,17 @@ LOG_CHANNEL_ID_2 = int(os.getenv("LOG_CHANNEL_ID_2", "0"))
 
 # Otomatik temizleme eşiği
 AUTO_CLEAN_THRESHOLD = 20
+
+# ═══════════════════════════════════════════════════════════════
+# DUYURU KANALI AYARLARI (Anti-Bot Saldırı)
+# ═══════════════════════════════════════════════════════════════
+# Duyuru kanalları (virgülle ayrılmış)
+ANNOUNCEMENT_CHANNELS_1 = [int(x.strip()) for x in os.getenv("ANNOUNCEMENT_CHANNELS_1", "").split(",") if x.strip()]
+ANNOUNCEMENT_CHANNELS_2 = [int(x.strip()) for x in os.getenv("ANNOUNCEMENT_CHANNELS_2", "").split(",") if x.strip()]
+
+# Anti-bot ayarları
+MASS_JOIN_THRESHOLD = int(os.getenv("MASS_JOIN_THRESHOLD", "10"))  # Kaç katılım
+MASS_JOIN_WINDOW = int(os.getenv("MASS_JOIN_WINDOW", "5"))  # Kaç saniyede
 
 # ═══════════════════════════════════════════════════════════════
 # LOGGING AYARLARI
@@ -81,6 +106,17 @@ class GroupSetStats:
     accumulated_rejected: int = 0
     last_cleanup_time: datetime = None
 
+@dataclass
+class AnnouncementChannelStats:
+    """Duyuru kanalı için istatistikler"""
+    recent_joins: deque = field(default_factory=lambda: deque(maxlen=500))
+    attack_mode: bool = False
+    attack_start_time: float = None
+    total_banned: int = 0
+    banned_in_current_attack: int = 0
+    last_join_time: float = None
+    channel_name: str = ""
+
 # ═══════════════════════════════════════════════════════════════
 # BOT SINIFI
 # ═══════════════════════════════════════════════════════════════
@@ -102,31 +138,102 @@ class AntiSpamBot:
                 API_HASH
             )
 
-        # Her grup seti için ayrı state
+        # Her grup seti için ayrı state (istek koruması)
         self.group_sets = {}
 
-        # Grup 1 için
-        if LOG_CHANNEL_ID_1 and PROTECTED_GROUPS_1:
-            self.group_sets[1] = {
-                'protected_groups': PROTECTED_GROUPS_1,
-                'log_channel': LOG_CHANNEL_ID_1,
-                'stats': GroupSetStats()
-            }
+        # Duyuru kanalları için ayarlar (bot saldırısı koruması)
+        self.announcement_sets = {}
 
-        # Grup 2 için
-        if LOG_CHANNEL_ID_2 and PROTECTED_GROUPS_2:
-            self.group_sets[2] = {
-                'protected_groups': PROTECTED_GROUPS_2,
-                'log_channel': LOG_CHANNEL_ID_2,
-                'stats': GroupSetStats()
-            }
-
-        # Log channel -> group set mapping
+        # Log channel -> set mapping
         self.log_to_set = {}
-        for set_id, data in self.group_sets.items():
-            self.log_to_set[data['log_channel']] = set_id
+
+        # Kanal -> Set mapping (duyuru için)
+        self.channel_to_set = {}
+
+        # Grup/Kanal isimleri cache
+        self.name_cache = {}
+
+        # Set 1 yapılandırması
+        if LOG_CHANNEL_ID_1:
+            # Grup koruması varsa ekle
+            if PROTECTED_GROUPS_1:
+                self.group_sets[1] = {
+                    'protected_groups': PROTECTED_GROUPS_1,
+                    'log_channel': LOG_CHANNEL_ID_1,
+                    'stats': GroupSetStats()
+                }
+                self.log_to_set[LOG_CHANNEL_ID_1] = 1
+
+            # Duyuru koruması varsa ekle
+            if ANNOUNCEMENT_CHANNELS_1:
+                self.announcement_sets[1] = {
+                    'channels': ANNOUNCEMENT_CHANNELS_1,
+                    'log_channel': LOG_CHANNEL_ID_1,
+                    'stats': {ch_id: AnnouncementChannelStats() for ch_id in ANNOUNCEMENT_CHANNELS_1}
+                }
+                for ch_id in ANNOUNCEMENT_CHANNELS_1:
+                    self.channel_to_set[ch_id] = 1
+                # Log channel mapping (duyuru için de gerekli)
+                if LOG_CHANNEL_ID_1 not in self.log_to_set:
+                    self.log_to_set[LOG_CHANNEL_ID_1] = 1
+
+        # Set 2 yapılandırması
+        if LOG_CHANNEL_ID_2:
+            # Grup koruması varsa ekle
+            if PROTECTED_GROUPS_2:
+                self.group_sets[2] = {
+                    'protected_groups': PROTECTED_GROUPS_2,
+                    'log_channel': LOG_CHANNEL_ID_2,
+                    'stats': GroupSetStats()
+                }
+                self.log_to_set[LOG_CHANNEL_ID_2] = 2
+
+            # Duyuru koruması varsa ekle
+            if ANNOUNCEMENT_CHANNELS_2:
+                self.announcement_sets[2] = {
+                    'channels': ANNOUNCEMENT_CHANNELS_2,
+                    'log_channel': LOG_CHANNEL_ID_2,
+                    'stats': {ch_id: AnnouncementChannelStats() for ch_id in ANNOUNCEMENT_CHANNELS_2}
+                }
+                for ch_id in ANNOUNCEMENT_CHANNELS_2:
+                    self.channel_to_set[ch_id] = 2
+                # Log channel mapping (duyuru için de gerekli)
+                if LOG_CHANNEL_ID_2 not in self.log_to_set:
+                    self.log_to_set[LOG_CHANNEL_ID_2] = 2
 
         self.me = None
+
+    async def get_chat_name(self, chat_id: int) -> str:
+        """Grup/Kanal ismini al (cache'li)"""
+        if chat_id in self.name_cache:
+            return self.name_cache[chat_id]
+
+        try:
+            chat = await self.client.get_entity(chat_id)
+            name = chat.title if hasattr(chat, 'title') else f"Chat {chat_id}"
+            self.name_cache[chat_id] = name
+            return name
+        except:
+            return f"Chat {chat_id}"
+
+    async def cache_all_names(self):
+        """Tüm grup/kanal isimlerini cache'e al"""
+        # Korunan gruplar
+        for data in self.group_sets.values():
+            for group_id in data['protected_groups']:
+                await self.get_chat_name(group_id)
+            await self.get_chat_name(data['log_channel'])
+
+        # Duyuru kanalları
+        for data in self.announcement_sets.values():
+            for ch_id in data['channels']:
+                name = await self.get_chat_name(ch_id)
+                # Stats'a da kaydet
+                if ch_id in data['stats']:
+                    data['stats'][ch_id].channel_name = name
+            await self.get_chat_name(data['log_channel'])
+
+        logger.info(f"Toplam {len(self.name_cache)} grup/kanal ismi yüklendi")
 
     async def start(self):
         """Botu başlat"""
@@ -137,8 +244,16 @@ class AntiSpamBot:
         self.me = await self.client.get_me()
         logger.info(f"Giriş yapıldı: @{self.me.username} ({self.me.first_name})")
 
-        # Tüm log kanallarından komut al
-        all_log_channels = [data['log_channel'] for data in self.group_sets.values()]
+        # Tüm grup/kanal isimlerini önceden al
+        await self.cache_all_names()
+
+        # Tüm log kanallarından komut al (hem grup hem duyuru setleri için)
+        all_log_channels = set()
+        for data in self.group_sets.values():
+            all_log_channels.add(data['log_channel'])
+        for data in self.announcement_sets.values():
+            all_log_channels.add(data['log_channel'])
+        all_log_channels = list(all_log_channels)
 
         if all_log_channels:
             self.client.add_event_handler(
@@ -149,9 +264,24 @@ class AntiSpamBot:
                 )
             )
 
+        # Duyuru kanallarına katılım handler'ı
+        all_announcement_channels = []
+        for data in self.announcement_sets.values():
+            all_announcement_channels.extend(data['channels'])
+
+        if all_announcement_channels:
+            self.client.add_event_handler(
+                self.on_channel_join,
+                events.ChatAction(chats=all_announcement_channels)
+            )
+            logger.info(f"Duyuru kanalları izleniyor: {len(all_announcement_channels)} kanal")
+
         # Bilgilendirme logları
         for set_id, data in self.group_sets.items():
             logger.info(f"Grup Seti {set_id}: {len(data['protected_groups'])} grup, Log: {data['log_channel']}")
+
+        for set_id, data in self.announcement_sets.items():
+            logger.info(f"Duyuru Seti {set_id}: {len(data['channels'])} kanal, Log: {data['log_channel']}")
 
         logger.info("Bot AÇIK başladı.")
 
@@ -372,7 +502,7 @@ class AntiSpamBot:
             logger.info(f"Grup Seti {set_id} - Otomatik temizleme: {total_pending} istek")
             await self.do_cleanup(set_id, manual=False)
 
-    async def send_log(self, set_id: int, message: str):
+    async def send_log(self, set_id: int, message: str, group_id: int = None):
         """Belirli grup setinin log grubuna mesaj gönder"""
         data = self.group_sets.get(set_id)
         if not data:
@@ -383,9 +513,173 @@ class AntiSpamBot:
             return
 
         try:
-            await self.client.send_message(log_channel, f"[Grup Seti {set_id}] {message}")
+            # Grup ismi varsa ekle
+            if group_id:
+                group_name = await self.get_chat_name(group_id)
+                prefix = f"[{group_name}]"
+            else:
+                prefix = ""
+
+            await self.client.send_message(log_channel, f"{prefix} {message}".strip())
         except Exception as e:
             logger.error(f"Log gönderme hatası: {e}")
+
+    # ═══════════════════════════════════════════════════════════════
+    # DUYURU KANALI - BOT SALDIRISI KORUMASI
+    # ═══════════════════════════════════════════════════════════════
+
+    async def on_channel_join(self, event):
+        """Duyuru kanalına katılım handler'ı - Bot saldırısı tespiti"""
+        # Sadece katılım olaylarını işle
+        if not event.user_joined and not event.user_added:
+            return
+
+        chat_id = event.chat_id
+        current_time = time.time()
+
+        # Hangi sete ait?
+        set_id = self.channel_to_set.get(chat_id)
+        if set_id is None:
+            return
+
+        data = self.announcement_sets[set_id]
+        stats = data['stats'].get(chat_id)
+        if stats is None:
+            return
+
+        # Kullanıcı bilgisi
+        user = await event.get_user()
+        if user is None or user.bot:
+            return
+
+        user_id = user.id
+        username = f"@{user.username}" if user.username else f"ID:{user_id}"
+
+        # Katılımı kaydet
+        stats.recent_joins.append({
+            'user_id': user_id,
+            'username': username,
+            'time': current_time
+        })
+        stats.last_join_time = current_time
+
+        # Eski kayıtları temizle (MASS_JOIN_WINDOW saniyeden eski)
+        cutoff_time = current_time - MASS_JOIN_WINDOW
+        while stats.recent_joins and stats.recent_joins[0]['time'] < cutoff_time:
+            stats.recent_joins.popleft()
+
+        # Son MASS_JOIN_WINDOW saniyedeki katılım sayısı
+        recent_count = len(stats.recent_joins)
+
+        # Saldırı modu kontrolü
+        if recent_count >= MASS_JOIN_THRESHOLD:
+            if not stats.attack_mode:
+                # Saldırı başladı!
+                stats.attack_mode = True
+                stats.attack_start_time = current_time
+                stats.banned_in_current_attack = 0
+
+                try:
+                    chat = await self.client.get_entity(chat_id)
+                    chat_title = chat.title if hasattr(chat, 'title') else f"Kanal {chat_id}"
+                except:
+                    chat_title = f"Kanal {chat_id}"
+
+                await self.send_announcement_log(
+                    set_id,
+                    chat_id,
+                    f"🚨 **BOT SALDIRISI TESPİT EDİLDİ!**\n"
+                    f"⚡ {MASS_JOIN_WINDOW} saniyede {recent_count} katılım!\n"
+                    f"🔒 Otomatik engelleme başlatıldı..."
+                )
+                logger.warning(f"BOT SALDIRISI: {chat_title} - {recent_count} katılım/{MASS_JOIN_WINDOW}sn")
+
+                # Tüm son katılımları engelle
+                for join_info in list(stats.recent_joins):
+                    await self.ban_user(chat_id, join_info['user_id'], set_id, stats)
+            else:
+                # Saldırı devam ediyor, bu kullanıcıyı da engelle
+                await self.ban_user(chat_id, user_id, set_id, stats)
+
+        elif stats.attack_mode:
+            # Saldırı modundayken gelen her katılımı engelle
+            await self.ban_user(chat_id, user_id, set_id, stats)
+
+            # Saldırı bitmiş mi kontrol et (3 saniye yeni katılım yok veya hız düştü)
+            time_since_attack = current_time - stats.attack_start_time
+            if time_since_attack > 3 and recent_count < MASS_JOIN_THRESHOLD // 2:
+                stats.attack_mode = False
+
+                try:
+                    chat = await self.client.get_entity(chat_id)
+                    chat_title = chat.title if hasattr(chat, 'title') else f"Kanal {chat_id}"
+                except:
+                    chat_title = f"Kanal {chat_id}"
+
+                await self.send_announcement_log(
+                    set_id,
+                    chat_id,
+                    f"✅ **Saldırı durduruldu!**\n"
+                    f"🚫 Toplam engellenen: {stats.banned_in_current_attack} hesap\n"
+                    f"📊 Genel toplam: {stats.total_banned} hesap"
+                )
+                logger.info(f"Saldırı durduruldu: {chat_title} - {stats.banned_in_current_attack} engellendi")
+
+    async def ban_user(self, chat_id: int, user_id: int, set_id: int, stats: AnnouncementChannelStats):
+        """Kullanıcıyı kanaldan engelle"""
+        try:
+            # Kalıcı ban
+            await self.client(EditBannedRequest(
+                channel=chat_id,
+                participant=user_id,
+                banned_rights=ChatBannedRights(
+                    until_date=None,  # Kalıcı
+                    view_messages=True,
+                    send_messages=True,
+                    send_media=True,
+                    send_stickers=True,
+                    send_gifs=True,
+                    send_games=True,
+                    send_inline=True,
+                    embed_links=True
+                )
+            ))
+
+            stats.total_banned += 1
+            stats.banned_in_current_attack += 1
+
+            if stats.banned_in_current_attack % 50 == 0:
+                logger.info(f"Saldırı devam ediyor: {stats.banned_in_current_attack} hesap engellendi...")
+
+            await asyncio.sleep(0.05)  # Rate limit koruması
+
+        except Exception as e:
+            error_str = str(e)
+            if "FLOOD_WAIT" in error_str:
+                import re
+                wait_match = re.search(r'(\d+)', error_str)
+                wait_time = int(wait_match.group(1)) if wait_match else 2
+                logger.warning(f"FloodWait ban: {wait_time}sn bekleniyor...")
+                await asyncio.sleep(wait_time)
+            elif "USER_NOT_PARTICIPANT" not in error_str:
+                logger.error(f"Ban hatası: {e}")
+
+    async def send_announcement_log(self, set_id: int, channel_id: int, message: str):
+        """Duyuru seti log kanalına mesaj gönder"""
+        data = self.announcement_sets.get(set_id)
+        if not data:
+            return
+
+        log_channel = data['log_channel']
+        if not log_channel:
+            return
+
+        try:
+            # Kanal ismini al
+            channel_name = await self.get_chat_name(channel_id)
+            await self.client.send_message(log_channel, f"[{channel_name}] {message}", parse_mode='md')
+        except Exception as e:
+            logger.error(f"Duyuru log gönderme hatası: {e}")
 
 # ═══════════════════════════════════════════════════════════════
 # ANA FONKSİYON
@@ -412,8 +706,17 @@ async def main():
     else:
         logger.warning("Grup Seti 2 yapılandırılmamış (PROTECTED_GROUPS_2 veya LOG_CHANNEL_ID_2 eksik)")
 
-    if not has_group_set:
-        logger.error("En az bir grup seti yapılandırılmalı!")
+    # Duyuru kanalı bilgileri
+    if ANNOUNCEMENT_CHANNELS_1:
+        logger.info(f"Duyuru Seti 1 yapılandırıldı: {len(ANNOUNCEMENT_CHANNELS_1)} kanal")
+    if ANNOUNCEMENT_CHANNELS_2:
+        logger.info(f"Duyuru Seti 2 yapılandırıldı: {len(ANNOUNCEMENT_CHANNELS_2)} kanal")
+
+    # En az bir set tanımlı olmalı
+    has_announcement = bool(ANNOUNCEMENT_CHANNELS_1 or ANNOUNCEMENT_CHANNELS_2)
+
+    if not has_group_set and not has_announcement:
+        logger.error("En az bir grup seti veya duyuru kanalı yapılandırılmalı!")
         return
 
     bot = AntiSpamBot()
@@ -421,18 +724,26 @@ async def main():
 
 if __name__ == "__main__":
     print("""
-    ╔═══════════════════════════════════════════════════════════╗
-    ║          TELEGRAM ANTI-SPAM BOT (2 GRUP SETİ)             ║
-    ╠═══════════════════════════════════════════════════════════╣
-    ║  Komutlar (İlgili log grubunda yazılır):                  ║
-    ║    /ac      - Botu aktif et (o grup seti için)            ║
-    ║    /kapat   - Botu kapat (o grup seti için)               ║
-    ║    /temizle - Tüm istekleri reddet (o grup seti için)     ║
-    ║                                                           ║
-    ║  Grup Seti 1: PROTECTED_GROUPS_1 + LOG_CHANNEL_ID_1       ║
-    ║  Grup Seti 2: PROTECTED_GROUPS_2 + LOG_CHANNEL_ID_2       ║
-    ║                                                           ║
-    ║  20+ istek = Otomatik temizleme                           ║
-    ╚═══════════════════════════════════════════════════════════╝
+    ╔═══════════════════════════════════════════════════════════════╗
+    ║       TELEGRAM ANTI-SPAM BOT (GRUP + DUYURU KORUMASI)         ║
+    ╠═══════════════════════════════════════════════════════════════╣
+    ║  İSTEK KORUMASI (Gruplar):                                    ║
+    ║    /ac      - Botu aktif et (o grup seti için)                ║
+    ║    /kapat   - Botu kapat (o grup seti için)                   ║
+    ║    /temizle - Tüm istekleri reddet (o grup seti için)         ║
+    ║    20+ istek = Otomatik temizleme                             ║
+    ║                                                               ║
+    ║  BOT SALDIRISI KORUMASI (Duyuru Kanalları):                   ║
+    ║    5 saniyede 10+ katılım = Saldırı tespiti                   ║
+    ║    Otomatik engelleme (ban) başlatılır                        ║
+    ║    Saldırı bitene kadar tüm katılımlar engellenir             ║
+    ║                                                               ║
+    ║  Yapılandırma (.env):                                         ║
+    ║    PROTECTED_GROUPS_1/2    - Korunan gruplar                  ║
+    ║    ANNOUNCEMENT_CHANNELS_1/2 - Duyuru kanalları               ║
+    ║    LOG_CHANNEL_ID_1/2      - Log kanalları                    ║
+    ║    MASS_JOIN_THRESHOLD     - Kaç katılımda saldırı (def: 10)  ║
+    ║    MASS_JOIN_WINDOW        - Kaç saniyede (def: 5)            ║
+    ╚═══════════════════════════════════════════════════════════════╝
     """)
     asyncio.run(main())
