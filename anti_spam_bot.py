@@ -751,3 +751,4 @@ if __name__ == "__main__":
     ║    MASS_JOIN_WINDOW        - Kaç saniyede (def: 5)            ║
     ╚═══════════════════════════════════════════════════════════════╝
     """)
+    asyncio.run(main())
