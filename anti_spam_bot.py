@@ -30,9 +30,8 @@ import logging
 
 from telethon import TelegramClient, events
 from telethon.tl.functions.messages import HideChatJoinRequestRequest, GetChatInviteImportersRequest
-from telethon.tl.functions.channels import EditBannedRequest
-from telethon.tl.types import ChatBannedRights, ChannelParticipantsRecent, UpdateChannelParticipant, ChannelParticipant
-from telethon.tl.functions.channels import GetParticipantsRequest
+from telethon.tl.functions.channels import EditBannedRequest, GetParticipantsRequest, GetFullChannelRequest
+from telethon.tl.types import ChatBannedRights, ChannelParticipantsRecent
 from collections import deque
 import time
 from dotenv import load_dotenv
@@ -131,6 +130,9 @@ class AnnouncementChannelStats:
     banned_in_current_attack: int = 0
     last_join_time: float = None
     channel_name: str = ""
+    last_known_count: int = 0  # Son bilinen üye sayısı
+    last_check_time: float = 0  # Son kontrol zamanı
+    known_user_ids: set = field(default_factory=set)  # Bilinen üye ID'leri
 
 # ═══════════════════════════════════════════════════════════════
 # BOT SINIFI
@@ -281,19 +283,15 @@ class AntiSpamBot:
                 )
             )
 
-        # Duyuru kanallarına katılım handler'ı - Raw event kullanıyoruz
+        # Duyuru kanalları için periyodik kontrol
         all_announcement_channels = []
         for data in self.announcement_sets.values():
             all_announcement_channels.extend(data['channels'])
 
         if all_announcement_channels:
-            # Raw event handler - UpdateChannelParticipant olaylarını yakalar
-            self.client.add_event_handler(
-                self.on_raw_channel_participant,
-                events.Raw(types=[UpdateChannelParticipant])
-            )
-            logger.info(f"Duyuru kanalları izleniyor (Raw event): {len(all_announcement_channels)} kanal")
-            logger.debug(f"İzlenen kanal ID'leri: {all_announcement_channels}")
+            logger.info(f"Duyuru kanalları izleniyor (periyodik kontrol): {len(all_announcement_channels)} kanal")
+            logger.info(f"İzlenen kanal ID'leri: {all_announcement_channels}")
+            # Periyodik kontrol task'ı aşağıda başlatılacak
 
         # Bilgilendirme logları
         for set_id, data in self.group_sets.items():
@@ -312,6 +310,10 @@ class AntiSpamBot:
 
         # Periyodik kontrol başlat
         asyncio.create_task(self.periodic_check())
+
+        # Duyuru kanalları için periyodik kontrol başlat
+        if self.announcement_sets:
+            asyncio.create_task(self.periodic_announcement_check())
 
         await self.client.run_until_disconnected()
 
@@ -546,122 +548,179 @@ class AntiSpamBot:
             logger.error(f"Log gönderme hatası: {e}")
 
     # ═══════════════════════════════════════════════════════════════
-    # DUYURU KANALI - BOT SALDIRISI KORUMASI
+    # DUYURU KANALI - BOT SALDIRISI KORUMASI (PERİYODİK KONTROL)
     # ═══════════════════════════════════════════════════════════════
 
-    async def on_raw_channel_participant(self, event: UpdateChannelParticipant):
-        """Raw event handler - Kanal katılımlarını yakalar"""
-        try:
-            # Channel ID'yi al (-100 prefix'i ekle)
-            channel_id = int(f"-100{event.channel_id}")
+    async def periodic_announcement_check(self):
+        """Her 3 saniyede bir duyuru kanallarını kontrol et"""
+        logger.info("🔄 Duyuru kanalları periyodik kontrol başlatıldı...")
 
-            logger.debug(f"Raw event alındı - Channel ID: {channel_id}, User ID: {event.user_id}")
+        # İlk çalıştırmada mevcut üyeleri kaydet (bunları engellemeyeceğiz)
+        await self.initialize_channel_members()
 
-            # Bu kanal izleniyor mu?
-            set_id = self.channel_to_set.get(channel_id)
-            if set_id is None:
-                logger.debug(f"Kanal izlenmiyor: {channel_id}")
-                return
-
-            # Yeni katılım mı kontrol et (new_participant dolu olmalı)
-            if event.new_participant is None:
-                logger.debug(f"Katılım değil, çıkış veya başka olay: {channel_id}")
-                return
-
-            # Sadece yeni üye katılımlarını işle
-            if not isinstance(event.new_participant, ChannelParticipant):
-                logger.debug(f"ChannelParticipant değil: {type(event.new_participant)}")
-                return
-
-            user_id = event.user_id
-            current_time = time.time()
-
-            logger.info(f"🔔 Yeni katılım tespit edildi - Kanal: {channel_id}, Kullanıcı: {user_id}")
-
-            # İstatistikleri al
-            data = self.announcement_sets[set_id]
-            stats = data['stats'].get(channel_id)
-            if stats is None:
-                logger.error(f"Stats bulunamadı: {channel_id}")
-                return
-
-            # Kullanıcı adını almaya çalış
+        while True:
             try:
-                user = await self.client.get_entity(user_id)
-                if user.bot:
-                    logger.debug(f"Bot kullanıcısı atlandı: {user_id}")
-                    return
-                username = f"@{user.username}" if user.username else f"ID:{user_id}"
+                await asyncio.sleep(3)  # 3 saniyede bir kontrol
+
+                for set_id, data in self.announcement_sets.items():
+                    for channel_id in data['channels']:
+                        await self.check_channel_for_new_members(set_id, channel_id)
+
             except Exception as e:
-                logger.warning(f"Kullanıcı bilgisi alınamadı: {user_id} - {e}")
-                username = f"ID:{user_id}"
+                logger.error(f"Periyodik duyuru kontrolü hatası: {e}", exc_info=True)
+                await asyncio.sleep(5)
 
-            # Katılımı kaydet
-            stats.recent_joins.append({
-                'user_id': user_id,
-                'username': username,
-                'time': current_time
-            })
-            stats.last_join_time = current_time
+    async def initialize_channel_members(self):
+        """Başlangıçta mevcut üye sayısını kaydet"""
+        for set_id, data in self.announcement_sets.items():
+            for channel_id in data['channels']:
+                stats = data['stats'].get(channel_id)
+                if stats is None:
+                    continue
 
-            # Eski kayıtları temizle (MASS_JOIN_WINDOW saniyeden eski)
-            cutoff_time = current_time - MASS_JOIN_WINDOW
-            while stats.recent_joins and stats.recent_joins[0]['time'] < cutoff_time:
-                stats.recent_joins.popleft()
+                try:
+                    # Kanal bilgisini al
+                    channel = await self.client.get_entity(channel_id)
+                    channel_name = channel.title if hasattr(channel, 'title') else f"Kanal {channel_id}"
+                    stats.channel_name = channel_name
 
-            # Son MASS_JOIN_WINDOW saniyedeki katılım sayısı
-            recent_count = len(stats.recent_joins)
+                    # Mevcut üye sayısını al (full chat info)
+                    from telethon.tl.functions.channels import GetFullChannelRequest
+                    full = await self.client(GetFullChannelRequest(channel_id))
+                    stats.last_known_count = full.full_chat.participants_count
+                    stats.last_check_time = time.time()
 
-            logger.debug(f"Son {MASS_JOIN_WINDOW} saniyede {recent_count} katılım (Eşik: {MASS_JOIN_THRESHOLD})")
+                    logger.info(f"📊 {channel_name}: {stats.last_known_count} mevcut üye")
 
-            # Saldırı modu kontrolü
-            if recent_count >= MASS_JOIN_THRESHOLD:
-                if not stats.attack_mode:
-                    # Saldırı başladı!
-                    stats.attack_mode = True
-                    stats.attack_start_time = current_time
-                    stats.banned_in_current_attack = 0
-
-                    chat_title = await self.get_chat_name(channel_id)
-
+                    # Log kanalına bildir
                     await self.send_announcement_log(
                         set_id,
                         channel_id,
-                        f"🚨 **BOT SALDIRISI TESPİT EDİLDİ!**\n"
-                        f"⚡ {MASS_JOIN_WINDOW} saniyede {recent_count} katılım!\n"
-                        f"🔒 Otomatik engelleme başlatıldı..."
+                        f"🟢 **Bot aktif!**\nMevcut üye sayısı: {stats.last_known_count}\nKontrol aralığı: 3 saniye"
                     )
-                    logger.warning(f"BOT SALDIRISI: {chat_title} - {recent_count} katılım/{MASS_JOIN_WINDOW}sn")
 
-                    # Tüm son katılımları engelle
-                    for join_info in list(stats.recent_joins):
-                        await self.ban_user(channel_id, join_info['user_id'], set_id, stats)
-                else:
-                    # Saldırı devam ediyor, bu kullanıcıyı da engelle
-                    await self.ban_user(channel_id, user_id, set_id, stats)
+                except Exception as e:
+                    logger.error(f"Kanal başlatma hatası {channel_id}: {e}")
 
-            elif stats.attack_mode:
-                # Saldırı modundayken gelen her katılımı engelle
-                await self.ban_user(channel_id, user_id, set_id, stats)
+    async def check_channel_for_new_members(self, set_id: int, channel_id: int):
+        """Bir kanalda yeni üye kontrolü yap"""
+        data = self.announcement_sets[set_id]
+        stats = data['stats'].get(channel_id)
+        if stats is None:
+            return
 
-                # Saldırı bitmiş mi kontrol et (3 saniye yeni katılım yok veya hız düştü)
-                time_since_attack = current_time - stats.attack_start_time
-                if time_since_attack > 3 and recent_count < MASS_JOIN_THRESHOLD // 2:
-                    stats.attack_mode = False
+        current_time = time.time()
 
-                    chat_title = await self.get_chat_name(channel_id)
+        try:
+            # Güncel üye sayısını al
+            full = await self.client(GetFullChannelRequest(channel_id))
+            current_count = full.full_chat.participants_count
 
-                    await self.send_announcement_log(
-                        set_id,
+            # Yeni üye var mı?
+            new_members_count = current_count - stats.last_known_count
+
+            if new_members_count > 0:
+                logger.info(f"🔔 {stats.channel_name}: +{new_members_count} yeni üye! (Toplam: {current_count})")
+
+                # Yeni üyeleri al (son eklenenler - recent participants)
+                try:
+                    from telethon.tl.types import ChannelParticipantsRecent
+                    participants = await self.client.get_participants(
                         channel_id,
-                        f"✅ **Saldırı durduruldu!**\n"
-                        f"🚫 Toplam engellenen: {stats.banned_in_current_attack} hesap\n"
-                        f"📊 Genel toplam: {stats.total_banned} hesap"
+                        filter=ChannelParticipantsRecent(),
+                        limit=min(new_members_count + 20, 100)
                     )
-                    logger.info(f"Saldırı durduruldu: {chat_title} - {stats.banned_in_current_attack} engellendi")
+
+                    # Yeni üyeleri tespit et
+                    new_user_ids = []
+                    for p in participants:
+                        if p.id not in stats.known_user_ids:
+                            new_user_ids.append(p.id)
+                            stats.known_user_ids.add(p.id)
+
+                    if new_user_ids:
+                        logger.info(f"🆕 {len(new_user_ids)} yeni kullanıcı tespit edildi")
+
+                        # Katılımları kaydet
+                        for user_id in new_user_ids:
+                            stats.recent_joins.append({
+                                'user_id': user_id,
+                                'time': current_time
+                            })
+
+                        # Eski kayıtları temizle
+                        cutoff_time = current_time - MASS_JOIN_WINDOW
+                        while stats.recent_joins and stats.recent_joins[0]['time'] < cutoff_time:
+                            stats.recent_joins.popleft()
+
+                        recent_count = len(stats.recent_joins)
+                        logger.info(f"📈 Son {MASS_JOIN_WINDOW}sn: {recent_count} katılım (Eşik: {MASS_JOIN_THRESHOLD})")
+
+                        # Saldırı kontrolü
+                        if recent_count >= MASS_JOIN_THRESHOLD:
+                            await self.handle_mass_join_attack(set_id, channel_id, stats, new_user_ids)
+                        elif stats.attack_mode:
+                            # Saldırı modundayken gelen her yeni üyeyi engelle
+                            for user_id in new_user_ids:
+                                await self.ban_user(channel_id, user_id, set_id, stats)
+
+                            # Saldırı bitmiş mi kontrol et
+                            if recent_count < MASS_JOIN_THRESHOLD // 2:
+                                await self.end_attack_mode(set_id, channel_id, stats)
+
+                except Exception as e:
+                    logger.error(f"Üye listesi alma hatası: {e}")
+
+            # Güncelle
+            stats.last_known_count = current_count
+            stats.last_check_time = current_time
 
         except Exception as e:
-            logger.error(f"Raw event handler hatası: {e}", exc_info=True)
+            error_str = str(e)
+            if "FLOOD_WAIT" in error_str:
+                import re
+                wait_match = re.search(r'(\d+)', error_str)
+                wait_time = int(wait_match.group(1)) if wait_match else 10
+                logger.warning(f"FloodWait: {wait_time} saniye bekleniyor...")
+                await asyncio.sleep(wait_time)
+            else:
+                logger.error(f"Kanal kontrol hatası {channel_id}: {e}")
+
+    async def handle_mass_join_attack(self, set_id: int, channel_id: int, stats: AnnouncementChannelStats, new_user_ids: list):
+        """Toplu katılım saldırısını işle"""
+        if not stats.attack_mode:
+            # Saldırı başladı!
+            stats.attack_mode = True
+            stats.attack_start_time = time.time()
+            stats.banned_in_current_attack = 0
+
+            recent_count = len(stats.recent_joins)
+
+            await self.send_announcement_log(
+                set_id,
+                channel_id,
+                f"🚨 **BOT SALDIRISI TESPİT EDİLDİ!**\n"
+                f"⚡ {MASS_JOIN_WINDOW} saniyede {recent_count} katılım!\n"
+                f"🔒 Otomatik engelleme başlatıldı..."
+            )
+            logger.warning(f"🚨 BOT SALDIRISI: {stats.channel_name} - {recent_count} katılım/{MASS_JOIN_WINDOW}sn")
+
+        # Tüm yeni üyeleri engelle
+        for user_id in new_user_ids:
+            await self.ban_user(channel_id, user_id, set_id, stats)
+
+    async def end_attack_mode(self, set_id: int, channel_id: int, stats: AnnouncementChannelStats):
+        """Saldırı modunu sonlandır"""
+        stats.attack_mode = False
+
+        await self.send_announcement_log(
+            set_id,
+            channel_id,
+            f"✅ **Saldırı durduruldu!**\n"
+            f"🚫 Bu saldırıda engellenen: {stats.banned_in_current_attack} hesap\n"
+            f"📊 Genel toplam: {stats.total_banned} hesap"
+        )
+        logger.info(f"✅ Saldırı durduruldu: {stats.channel_name} - {stats.banned_in_current_attack} engellendi")
 
     async def ban_user(self, chat_id: int, user_id: int, set_id: int, stats: AnnouncementChannelStats):
         """Kullanıcıyı kanaldan engelle"""
