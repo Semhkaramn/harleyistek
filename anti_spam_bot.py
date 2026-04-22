@@ -21,6 +21,7 @@ import logging
 
 from telethon import TelegramClient, events
 from telethon.tl.functions.messages import HideChatJoinRequestRequest, GetChatInviteImportersRequest
+from telethon.tl.types import InputUserEmpty
 from dotenv import load_dotenv
 
 # .env dosyasını yükle
@@ -316,7 +317,7 @@ class AntiSpamBot:
                         requested=True,
                         limit=100,
                         offset_date=None,
-                        offset_user=0,
+                        offset_user=InputUserEmpty(),
                         q=""
                     ))
 
@@ -372,7 +373,7 @@ class AntiSpamBot:
                 requested=True,
                 limit=1,
                 offset_date=None,
-                offset_user=0,
+                offset_user=InputUserEmpty(),
                 q=""
             ))
             count = result.count if hasattr(result, 'count') else len(result.importers)
