@@ -166,13 +166,22 @@ class AntiSpamBot:
 
     async def periodic_check(self):
         """Her 10 saniyede bir istek sayısını kontrol et"""
+        logger.info("Periyodik kontrol döngüsü başlatıldı (10 saniye aralıklarla)")
+        check_count = 0
         while True:
             await asyncio.sleep(10)
+            check_count += 1
 
             for set_id, data in self.group_sets.items():
                 stats = data['stats']
 
-                if stats.state != BotState.ACTIVE or stats.clearing_in_progress:
+                if stats.state != BotState.ACTIVE:
+                    if check_count % 6 == 0:  # Her dakikada bir logla
+                        logger.info(f"Grup Seti {set_id} - Bot aktif değil (state: {stats.state})")
+                    continue
+
+                if stats.clearing_in_progress:
+                    logger.info(f"Grup Seti {set_id} - Temizleme devam ediyor, kontrol atlanıyor")
                     continue
 
                 # 2 dakika silme olmadıysa ve birikmiş varsa log at
@@ -189,7 +198,12 @@ class AntiSpamBot:
                     count = await self.get_pending_count(group_id)
                     total_pending += count
 
+                # Her 30 saniyede bir durum logla (3 check = 30 saniye)
+                if check_count % 3 == 0:
+                    logger.info(f"[Periyodik] Grup Seti {set_id} - Bekleyen: {total_pending}, Eşik: {AUTO_CLEAN_THRESHOLD}")
+
                 if total_pending > AUTO_CLEAN_THRESHOLD:
+                    logger.info(f"[Periyodik] Grup Seti {set_id} - Eşik aşıldı! Temizleme başlatılıyor...")
                     await self.do_cleanup(set_id, manual=False)
 
     async def on_command(self, event):
@@ -256,7 +270,10 @@ class AntiSpamBot:
         stats = data['stats']
 
         if stats.clearing_in_progress:
+            logger.info(f"Grup Seti {set_id} - Temizleme zaten devam ediyor, atlanıyor")
             return
+
+        logger.info(f"Grup Seti {set_id} - Temizleme başlıyor (Manual: {manual})")
 
         previous_state = stats.state
         stats.state = BotState.CLEARING
@@ -265,8 +282,10 @@ class AntiSpamBot:
         # Bu setteki tüm gruplardaki istekleri temizle
         total_rejected = 0
         for group_id in data['protected_groups']:
+            logger.info(f"Grup {group_id} temizleniyor...")
             rejected = await self.clear_all_requests(group_id)
             total_rejected += rejected
+            logger.info(f"Grup {group_id} - {rejected} istek reddedildi")
 
         stats.clearing_in_progress = False
         stats.state = previous_state if not manual else BotState.INACTIVE
@@ -275,7 +294,11 @@ class AntiSpamBot:
         stats.accumulated_rejected += total_rejected
         stats.last_cleanup_time = datetime.now()
 
-        logger.info(f"Grup Seti {set_id} - Temizlendi: {total_rejected} (Toplam: {stats.accumulated_rejected})")
+        logger.info(f"Grup Seti {set_id} - Temizleme tamamlandı: {total_rejected} istek silindi (Toplam birikmiş: {stats.accumulated_rejected})")
+
+        # Eğer istek silindiyse log grubuna bildir
+        if total_rejected > 0:
+            await self.send_log(set_id, f"🗑️ {total_rejected} istek silindi (Otomatik: {not manual})")
 
     async def clear_all_requests(self, chat_id: int) -> int:
         """Bir gruptaki tüm bekleyen istekleri reddet"""
@@ -284,6 +307,7 @@ class AntiSpamBot:
         try:
             chat = await self.client.get_entity(chat_id)
             chat_title = chat.title if hasattr(chat, 'title') else f"Grup {chat_id}"
+            logger.info(f"Grup '{chat_title}' ({chat_id}) istekleri siliniyor...")
 
             while True:
                 try:
