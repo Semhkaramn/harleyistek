@@ -351,8 +351,11 @@ class AntiSpamBot:
                 offset_user=0,
                 q=""
             ))
-            return result.count if hasattr(result, 'count') else len(result.importers)
-        except:
+            count = result.count if hasattr(result, 'count') else len(result.importers)
+            logger.info(f"Grup {chat_id} - Bekleyen istek: {count}")
+            return count
+        except Exception as e:
+            logger.error(f"Bekleyen istek sayısı alınamadı (Grup {chat_id}): {e}")
             return 0
 
     async def check_and_auto_clean(self, set_id: int):
@@ -360,7 +363,13 @@ class AntiSpamBot:
         data = self.group_sets[set_id]
         stats = data['stats']
 
+        # State kontrolü ekle - sadece ACTIVE iken çalış
+        if stats.state != BotState.ACTIVE:
+            logger.info(f"Grup Seti {set_id} - Bot aktif değil, kontrol atlanıyor")
+            return
+
         if stats.clearing_in_progress:
+            logger.info(f"Grup Seti {set_id} - Temizleme devam ediyor, kontrol atlanıyor")
             return
 
         total_pending = 0
@@ -368,9 +377,13 @@ class AntiSpamBot:
             count = await self.get_pending_count(group_id)
             total_pending += count
 
+        logger.info(f"Grup Seti {set_id} - Toplam bekleyen istek: {total_pending} (Eşik: {AUTO_CLEAN_THRESHOLD})")
+
         if total_pending > AUTO_CLEAN_THRESHOLD:
-            logger.info(f"Grup Seti {set_id} - Otomatik temizleme: {total_pending} istek")
+            logger.info(f"Grup Seti {set_id} - Otomatik temizleme başlatılıyor: {total_pending} istek")
             await self.do_cleanup(set_id, manual=False)
+        else:
+            logger.info(f"Grup Seti {set_id} - Temizleme gerekmiyor ({total_pending} <= {AUTO_CLEAN_THRESHOLD})")
 
     async def send_log(self, set_id: int, message: str):
         """Belirli grup setinin log grubuna mesaj gönder"""
